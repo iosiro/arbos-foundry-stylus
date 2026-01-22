@@ -53,15 +53,9 @@ arbcompress, host-io, program-exec, soft-float, user-host, user-test, wasi-stub
 
 - `FORK-CHANGES.md` - This file
 - `README.md` - Fork documentation
-- `crates/prover/src/forward_stub.wat` - WASM stub for forward module (generated at compile time)
+- `crates/prover/src/forward_stub.wat` - WASM stub for forward module
 
 ## Maintenance Log
-
-### 4b832e2ae - Generate forward_stub at compile time
-
-- Converted `forward` crate from binary to library
-- `forward_stub.wat` is now generated at compile time via build script
-- Added `bin/mod.rs` for the binary entry point
 
 ### v3.9.5 (Initial Fork)
 
@@ -70,4 +64,4 @@ arbcompress, host-io, program-exec, soft-float, user-host, user-test, wasi-stub
 
 ---
 
-*Last updated: 2026-01-22*
+*Last updated: 2025-01-22*
