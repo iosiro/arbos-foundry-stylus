@@ -69,11 +69,14 @@ arbcompress, host-io, program-exec, soft-float, user-host, user-test, wasi-stub
 
 ## Maintenance Log
 
+### Update wasmer for newer Rust versions
+
+- Updated wasmer to support newer Rust versions (probestack fix)
+
 ### Vendor wasmer into repository
 
 - Converted wasmer from git submodule to vendored code
-- Wasmer commit: 6d91a89f61243de499dcc04ef4e9123054bf4044 (stylus branch)
-- Fork of https://github.com/OffchainLabs/wasmer.git
+- Fork of https://github.com/OffchainLabs/wasmer.git (stylus branch)
 
 ### 893424b8e - Generate forward_stub at compile time
 
