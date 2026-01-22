@@ -40,12 +40,18 @@ The following upstream crates are intentionally excluded:
 
 ## Vendored Dependencies
 
+### brotli
+
+- **Location**: `brotli/`
+- **Upstream Repository**: https://github.com/google/brotli
+
+The Google Brotli C library is vendored for use by `crates/brotli` which provides
+Brotli compression with Stylus-specific dictionaries.
+
 ### wasmer
 
 - **Location**: `crates/tools/wasmer/`
-- **Upstream Repository**: https://github.com/OffchainLabs/wasmer.git
-- **Commit**: e7d121950b1e88b52179999af34d79eae8e5056f (stylus branch)
-- **Commit Message**: chore: support newer rust versions (probestack)
+- **Upstream Repository**: https://github.com/OffchainLabs/wasmer.git (stylus branch)
 
 The Wasmer runtime is vendored directly into this repository rather than included
 as a git submodule for simpler dependency management.
@@ -68,6 +74,11 @@ arbcompress, host-io, program-exec, soft-float, user-host, user-test, wasi-stub
 - `crates/prover/build.rs` - Build script to generate forward_stub.wat
 
 ## Maintenance Log
+
+### Vendor brotli into repository
+
+- Vendored Google Brotli C library from https://github.com/google/brotli
+- Required by `crates/brotli` for compression support
 
 ### Update wasmer for newer Rust versions
 
