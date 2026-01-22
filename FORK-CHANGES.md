@@ -38,11 +38,23 @@ The following upstream crates are intentionally excluded:
 | `validator` | Validation service |
 | `wasm-testsuite` | Test suite |
 
+## Vendored Dependencies
+
+### wasmer
+
+- **Location**: `crates/tools/wasmer/`
+- **Upstream Repository**: https://github.com/OffchainLabs/wasmer.git
+- **Commit**: e7d121950b1e88b52179999af34d79eae8e5056f (stylus branch)
+- **Commit Message**: chore: support newer rust versions (probestack)
+
+The Wasmer runtime is vendored directly into this repository rather than included
+as a git submodule for simpler dependency management.
+
 ## Excluded from Workspace
 
 These directories are excluded from the workspace but still required:
 
-- `crates/tools/wasmer/` - Wasmer runtime (path dependency)
+- `crates/tools/wasmer/` - Wasmer runtime (vendored)
 - `crates/wasm-libraries/user-host-trait/` - Required by stylus
 - `crates/wasm-libraries/forward/` - Build dependency of prover
 
@@ -56,6 +68,12 @@ arbcompress, host-io, program-exec, soft-float, user-host, user-test, wasi-stub
 - `crates/prover/build.rs` - Build script to generate forward_stub.wat
 
 ## Maintenance Log
+
+### Vendor wasmer into repository
+
+- Converted wasmer from git submodule to vendored code
+- Wasmer commit: 6d91a89f61243de499dcc04ef4e9123054bf4044 (stylus branch)
+- Fork of https://github.com/OffchainLabs/wasmer.git
 
 ### 893424b8e - Generate forward_stub at compile time
 

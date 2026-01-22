@@ -1,3 +1,0 @@
-[submodule "crates/tools/wasmer"]
-	path = crates/tools/wasmer
-	url = https://github.com/iosiro/arbos-foundry-wasmer.git
