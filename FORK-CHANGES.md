@@ -53,9 +53,16 @@ arbcompress, host-io, program-exec, soft-float, user-host, user-test, wasi-stub
 
 - `FORK-CHANGES.md` - This file
 - `README.md` - Fork documentation
-- `crates/prover/src/forward_stub.wat` - WASM stub for forward module
+- `crates/prover/build.rs` - Build script to generate forward_stub.wat
 
 ## Maintenance Log
+
+### 893424b8e - Generate forward_stub at compile time
+
+- Added build script to prover that generates `forward_stub.wat` at compile time
+- Converted `forward` crate to a library exposing `forward_stub()` function
+- Removed dependency on pre-built `target/machines/latest/forward_stub.wasm`
+- The WAT is now parsed directly instead of requiring a separate WASM build step
 
 ### v3.9.5 (Initial Fork)
 
@@ -64,4 +71,4 @@ arbcompress, host-io, program-exec, soft-float, user-host, user-test, wasi-stub
 
 ---
 
-*Last updated: 2025-01-22*
+*Last updated: 2026-01-22*
