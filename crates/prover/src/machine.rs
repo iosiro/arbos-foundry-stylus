@@ -334,7 +334,7 @@ lazy_static! {
     static ref USER_IMPORTS: HashMap<String, AvailableImport> = {
         let mut imports = HashMap::default();
 
-        let forward = include_bytes!("forward_stub.wat");
+        let forward = include_bytes!(concat!(env!("OUT_DIR"), "/forward_stub.wat"));
         let forward = wat::parse_bytes(forward).unwrap();
         let forward = binary::parse(&forward, Path::new("forward"))
             .unwrap();
