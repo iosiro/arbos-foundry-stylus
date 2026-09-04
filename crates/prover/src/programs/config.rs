@@ -11,6 +11,9 @@ use std::fmt::Debug;
 use wasmer_types::{Pages, SignatureIndex, WASM_PAGE_SIZE};
 use wasmparser::Operator;
 
+/// Minimum Stylus version that uses the spec-compliant `memory.fill` implementation.
+pub const FIXED_MEMORY_FILL_VERSION: u16 = 3;
+
 #[cfg(feature = "native")]
 use {
     super::{
@@ -161,7 +164,7 @@ impl CompileConfig {
 
         match version {
             0 => {}
-            1 | 2 => {
+            1..=3 => {
                 config.bounds.heap_bound = Pages(128); // 8 mb
                 config.bounds.max_frame_size = 10 * 1024;
                 config.bounds.max_frame_contention = 4096;

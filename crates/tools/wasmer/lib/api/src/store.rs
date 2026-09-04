@@ -101,6 +101,11 @@ impl Store {
     pub fn id(&self) -> StoreId {
         self.inner.objects.id()
     }
+
+    /// Sets the Stylus semantic version used by version-sensitive VM libcalls.
+    pub fn set_stylus_version(&mut self, version: u16) {
+        self.inner.objects.set_stylus_version(version);
+    }
 }
 
 impl PartialEq for Store {

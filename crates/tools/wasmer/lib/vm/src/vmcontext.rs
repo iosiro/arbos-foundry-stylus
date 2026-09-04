@@ -359,7 +359,11 @@ pub(crate) unsafe fn memory_fill(
     dst: u32,
     val: u32,
     len: u32,
+    stylus_version: u16,
 ) -> Result<(), Trap> {
+    if stylus_version < 3 && val > 0xFF {
+        return Err(Trap::lib(TrapCode::MemoryFillValueOverflow));
+    }
     if dst
         .checked_add(len)
         .map_or(true, |m| usize::try_from(m).unwrap() > mem.current_length)
@@ -781,11 +785,11 @@ unsafe impl Sync for VMMemoryDefinition {}
 
 #[cfg(test)]
 mod test_vmmemory_definition {
-    use super::VMMemoryDefinition;
-    use crate::VMOffsets;
+    use super::{memory_fill, VMMemoryDefinition};
+    use crate::{Trap, VMOffsets};
     use memoffset::offset_of;
     use std::mem::size_of;
-    use wasmer_types::ModuleInfo;
+    use wasmer_types::{ModuleInfo, TrapCode};
 
     #[test]
     fn check_vmmemory_definition_offsets() {
@@ -803,5 +807,25 @@ mod test_vmmemory_definition {
             offset_of!(VMMemoryDefinition, current_length),
             usize::from(offsets.vmmemory_definition_current_length())
         );
+    }
+
+    #[test]
+    fn memory_fill_value_width_depends_on_stylus_version() {
+        let mut bytes = [0u8; 4];
+        let memory = VMMemoryDefinition {
+            base: bytes.as_mut_ptr(),
+            current_length: bytes.len(),
+        };
+        let error = unsafe { memory_fill(&memory, 0, 0x123, 1, 2) }.unwrap_err();
+        assert!(matches!(
+            error,
+            Trap::Lib {
+                trap_code: TrapCode::MemoryFillValueOverflow,
+                ..
+            }
+        ));
+
+        unsafe { memory_fill(&memory, 0, 0x123, 1, 3) }.unwrap();
+        assert_eq!(bytes[0], 0x23);
     }
 }

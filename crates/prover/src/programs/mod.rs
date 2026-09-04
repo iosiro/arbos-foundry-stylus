@@ -39,6 +39,8 @@ pub mod prelude;
 pub mod start;
 
 pub const STYLUS_ENTRY_POINT: &str = "user_entrypoint";
+/// Minimum Stylus version that rejects WebAssembly multi-value constructs.
+pub const STYLUS_VERSION_DISABLE_MULTIVALUE: u16 = 3;
 
 pub trait ModuleMod {
     fn add_global(&mut self, name: &str, ty: Type, init: GlobalInit) -> Result<GlobalIndex>;
@@ -425,9 +427,15 @@ impl Module {
         gas: &mut u64,
     ) -> Result<(Self, StylusData)> {
         let compile = CompileConfig::version(stylus_version, debug);
-        let (bin, stylus_data) =
-            WasmBinary::parse_user(wasm, arbos_version_for_gas, page_limit, &compile, codehash)
-                .wrap_err("failed to parse wasm")?;
+        let (bin, stylus_data) = WasmBinary::parse_user(
+            wasm,
+            stylus_version,
+            arbos_version_for_gas,
+            page_limit,
+            &compile,
+            codehash,
+        )
+        .wrap_err("failed to parse wasm")?;
 
         if arbos_version_for_gas > 0 {
             // converts a number of microseconds to gas
@@ -477,9 +485,58 @@ impl Module {
             pay!(code.saturating_mul(535) / 1_000);
         }
 
-        let module = Self::from_user_binary(&bin, compile.debug.debug_funcs, Some(stylus_data))
-            .wrap_err("failed to build user module")?;
+        let module = Self::from_user_binary(
+            &bin,
+            compile.debug.debug_funcs,
+            Some(stylus_data),
+            compile.version,
+        )
+        .wrap_err("failed to build user module")?;
 
         Ok((module, stylus_data))
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+    use crate::binary;
+    use std::path::Path;
+
+    #[test]
+    fn stylus_v3_rejects_multi_value_wasm() {
+        let wasm = wat::parse_str(
+            r#"(module
+                (func (result i32 i32) i32.const 1 i32.const 2)
+            )"#,
+        )
+        .unwrap();
+
+        assert!(binary::parse_with_stylus_version(&wasm, Path::new("test"), 2).is_ok());
+        assert!(binary::parse_with_stylus_version(&wasm, Path::new("test"), 3).is_err());
+    }
+
+    #[test]
+    fn stylus_v3_selects_fixed_memory_fill() {
+        let wasm = wat::parse_str(
+            r#"(module
+                (memory (export "memory") 1 1)
+                (func (export "user_entrypoint") (param i32) (result i32)
+                    i32.const 0
+                    i32.const 0x1234
+                    i32.const 8
+                    memory.fill
+                    i32.const 0))"#,
+        )
+        .unwrap();
+        let activate = |version| {
+            let mut gas = u64::MAX;
+            Module::activate(&wasm, &Bytes32::default(), version, 0, 128, false, &mut gas)
+                .unwrap()
+                .0
+                .hash()
+        };
+
+        assert_ne!(activate(2), activate(3));
     }
 }
