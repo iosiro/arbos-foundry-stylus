@@ -8,10 +8,9 @@ fn main() {
     let target_arch = env::var("TARGET").unwrap();
 
     if target_arch.contains("wasm32") {
-        println!("cargo:rustc-link-search=../../target/lib-wasm/");
+        println!("cargo:rustc-link-search=target/lib-wasm/");
     } else {
         println!("cargo:rustc-link-search=target/lib/");
-        println!("cargo:rustc-link-search=../../target/lib/");
     }
     println!("cargo:rustc-link-lib=static=brotlienc-static");
     println!("cargo:rustc-link-lib=static=brotlidec-static");
@@ -20,8 +19,7 @@ fn main() {
 
 #[cfg(feature = "cc_brotli")]
 fn main() {
-    use std::env;
-    use std::path::PathBuf;
+    use std::{env, path::PathBuf};
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let include_dir = manifest_dir.join("../../brotli/c/include");
     cc::Build::new()

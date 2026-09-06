@@ -3,64 +3,21 @@
 
 #![allow(clippy::vec_init_then_push, clippy::redundant_closure)]
 
-use crate::{
-    binary,
-    machine::{Function, InboxIdentifier},
-    programs::{config::FIXED_MEMORY_FILL_VERSION, StylusData},
-    utils,
-    value::{ArbValueType, FunctionType},
-    wavm::{wasm_to_wavm, Instruction, Opcode},
-};
-use arbutil::{evm::user::UserOutcomeKind, Color, PreimageType};
-use eyre::{bail, ErrReport, Result};
-use lazy_static::lazy_static;
-use num_derive::FromPrimitive;
 use std::{collections::HashMap, path::Path, str::FromStr};
 
-/// Represents the internal hostio functions a module may have.
-#[derive(Clone, Copy, Debug, FromPrimitive)]
-#[repr(u64)]
-pub enum InternalFunc {
-    WavmCallerLoad8,
-    WavmCallerLoad32,
-    WavmCallerStore8,
-    WavmCallerStore32,
-    MemoryFill,
-    MemoryCopy,
-    UserInkLeft,
-    UserInkStatus,
-    UserSetInk,
-    UserStackLeft,
-    UserSetStack,
-    UserMemorySize,
-    CallMain,
-}
+use arbutil::{Color, PreimageType, evm::user::UserOutcomeKind};
+use eyre::{ErrReport, Result, bail};
+use lazy_static::lazy_static;
 
-impl InternalFunc {
-    pub fn ty(&self) -> FunctionType {
-        use ArbValueType::*;
-        use InternalFunc::*;
-        macro_rules! func {
-            ([$($args:expr),*], [$($outs:expr),*]) => {
-                FunctionType::new(vec![$($args),*], vec![$($outs),*])
-            };
-        }
-        #[rustfmt::skip]
-        let ty = match self {
-            WavmCallerLoad8  | WavmCallerLoad32  => func!([I32], [I32]),
-            WavmCallerStore8 | WavmCallerStore32 => func!([I32, I32], []),
-            MemoryFill       | MemoryCopy        => func!([I32, I32, I32], []),
-            UserInkLeft    => func!([], [I64]),      // λ() → ink_left
-            UserInkStatus  => func!([], [I32]),      // λ() → ink_status
-            UserSetInk     => func!([I64, I32], []), // λ(ink_left, ink_status)
-            UserStackLeft  => func!([], [I32]),      // λ() → stack_left
-            UserSetStack   => func!([I32], []),      // λ(stack_left)
-            UserMemorySize => func!([], [I32]),      // λ() → memory_size
-            CallMain       => func!([I32], [I32]),   // λ(args_len) → status
-        };
-        ty
-    }
-}
+use crate::{
+    binary,
+    internal_func::InternalFunc,
+    machine::{Function, InboxIdentifier},
+    programs::{StylusData, config::FIXED_MEMORY_FILL_VERSION},
+    utils,
+    value::{ArbValueType, FunctionType},
+    wavm::{Instruction, Opcode, wasm_to_wavm},
+};
 
 /// Represents the internal hostio functions a module may have.
 pub enum Hostio {
@@ -72,6 +29,7 @@ pub enum Hostio {
     WavmSetGlobalStateBytes32,
     WavmGetGlobalStateU64,
     WavmSetGlobalStateU64,
+    WavmGetEndParentChainBlockHash,
     WavmValidateCertificate,
     WavmReadKeccakPreimage,
     WavmReadSha256Preimage,
@@ -121,6 +79,7 @@ impl FromStr for Hostio {
             ("env", "wavm_set_globalstate_bytes32") => WavmSetGlobalStateBytes32,
             ("env", "wavm_get_globalstate_u64") => WavmGetGlobalStateU64,
             ("env", "wavm_set_globalstate_u64") => WavmSetGlobalStateU64,
+            ("env", "wavm_get_end_parent_chain_block_hash") => WavmGetEndParentChainBlockHash,
             ("env", "wavm_validate_certificate") => WavmValidateCertificate,
             ("env", "wavm_read_keccak_256_preimage") => WavmReadKeccakPreimage,
             ("env", "wavm_read_sha2_256_preimage") => WavmReadSha256Preimage,
@@ -166,10 +125,10 @@ impl Hostio {
             () => {
                 FunctionType::default()
             };
-            ([$($args:expr),*]) => {
+            ([$($args:expr_2021),*]) => {
                 FunctionType::new(vec![$($args),*], vec![])
             };
-            ([$($args:expr),*], [$($outs:expr),*]) => {
+            ([$($args:expr_2021),*], [$($outs:expr_2021),*]) => {
                 FunctionType::new(vec![$($args),*], vec![$($outs),*])
             };
         }
@@ -184,6 +143,7 @@ impl Hostio {
             WavmSetGlobalStateBytes32        => func!([I32, I32]),
             WavmGetGlobalStateU64            => func!([I32], [I64]),
             WavmSetGlobalStateU64            => func!([I32, I64]),
+            WavmGetEndParentChainBlockHash => func!([I32]),
             WavmValidateCertificate          => func!([I32, I32], [I32]),
             WavmReadKeccakPreimage           => func!([I32, I32], [I32]),
             WavmReadSha256Preimage           => func!([I32, I32], [I32]),
@@ -223,10 +183,10 @@ impl Hostio {
         let mut body = vec![];
 
         macro_rules! opcode {
-            ($opcode:expr) => {
+            ($opcode:expr_2021) => {
                 body.push(Instruction::simple($opcode))
             };
-            ($opcode:expr, $value:expr) => {
+            ($opcode:expr_2021, $value:expr_2021) => {
                 body.push(Instruction::with_data($opcode, $value as u64))
             };
         }
@@ -281,6 +241,10 @@ impl Hostio {
                 opcode!(LocalGet, 0);
                 opcode!(LocalGet, 1);
                 opcode!(SetGlobalStateU64);
+            }
+            WavmGetEndParentChainBlockHash => {
+                opcode!(LocalGet, 0);
+                opcode!(GetEndParentChainBlockHash);
             }
             WavmValidateCertificate => {
                 opcode!(LocalGet, 0); // hash
@@ -436,6 +400,9 @@ pub fn get_impl(module: &str, name: &str) -> Result<(Function, bool)> {
 
 /// Adds internal functions to a module.
 /// Note: the order of the functions must match that of the `InternalFunc` enum
+/// `version` is the Stylus version of the program being compiled; it selects version-specific
+/// implementations (e.g. the fixed `memory.fill` is used for version >=
+/// [`FIXED_MEMORY_FILL_VERSION`]).
 pub fn new_internal_funcs(stylus_data: Option<StylusData>, version: u16) -> Vec<Function> {
     use ArbValueType::*;
     use InternalFunc::*;
@@ -516,17 +483,38 @@ pub fn new_internal_funcs(stylus_data: Option<StylusData>, version: u16) -> Vec<
 
 fn load_bulk_func(
     data: &[u8],
-    _wat_name: &str,
+    wat_name: &str,
     index: usize,
     expected_name: &str,
     expected_ty: FunctionType,
 ) -> Function {
-    let wasm = wat::parse_bytes(data).expect("failed to parse bulk memory wat");
-    let bin =
-        binary::parse(&wasm, Path::new("internal")).expect("failed to parse bulk memory wasm");
-    let code = &bin.codes[index];
-    let name = bin.names.functions.get(&(index as u32)).unwrap();
-    let ty = &bin.types[bin.functions[index] as usize];
+    let wasm = wat::parse_bytes(data).unwrap_or_else(|e| panic!("failed to parse {wat_name}: {e}"));
+    let bin = binary::parse(&wasm, Path::new("internal"))
+        .unwrap_or_else(|e| panic!("failed to parse {wat_name}: {e}"));
+
+    let code = bin.codes.get(index).unwrap_or_else(|| {
+        panic!(
+            "{wat_name} has {} function(s) but index {index} was requested",
+            bin.codes.len()
+        )
+    });
+    let name = bin
+        .names
+        .functions
+        .get(&(index as u32))
+        .unwrap_or_else(|| panic!("no name found for function at index {index} in {wat_name}"));
+    let func_type_idx = bin.functions.get(index).copied().unwrap_or_else(|| {
+        panic!(
+            "{wat_name} functions list has {} entries but index {index} was requested",
+            bin.functions.len()
+        )
+    });
+    let ty = bin.types.get(func_type_idx as usize).unwrap_or_else(|| {
+        panic!(
+            "{wat_name} types list has {} entries but index {func_type_idx} was requested",
+            bin.types.len()
+        )
+    });
     assert_eq!(ty, &expected_ty);
     assert_eq!(name, expected_name);
 
@@ -547,7 +535,7 @@ fn load_bulk_func(
         ty.clone(),
         &[], // impls don't make calls
     )
-    .expect("failed to create bulk memory func")
+    .unwrap_or_else(|e| panic!("failed to compile {expected_name} from {wat_name}: {e}"))
 }
 
 lazy_static! {
@@ -556,20 +544,20 @@ lazy_static! {
         "bulk_memory.wat",
         0,
         "memory_fill",
-        InternalFunc::MemoryFill.ty()
+        InternalFunc::MemoryFill.ty(),
     );
     static ref BULK_MEMORY_COPY: Function = load_bulk_func(
         include_bytes!("bulk_memory.wat"),
         "bulk_memory.wat",
         1,
         "memory_copy",
-        InternalFunc::MemoryCopy.ty()
+        InternalFunc::MemoryCopy.ty(),
     );
     static ref BULK_MEMORY_FILL_V2: Function = load_bulk_func(
         include_bytes!("bulk_memory_v2.wat"),
         "bulk_memory_v2.wat",
         0,
         "memory_fill",
-        InternalFunc::MemoryFill.ty()
+        InternalFunc::MemoryFill.ty(),
     );
 }

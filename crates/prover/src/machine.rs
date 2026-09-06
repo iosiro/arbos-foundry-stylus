@@ -1,41 +1,8 @@
 // Copyright 2021-2026, Offchain Labs, Inc.
 // For license information, see https://github.com/OffchainLabs/nitro/blob/master/LICENSE.md
 
-#[cfg(feature = "native")]
-use crate::kzg::prove_kzg_preimage;
-use crate::{
-    binary::{
-        self, parse, ExportKind, ExportMap, FloatInstruction, Local, NameCustomSection, WasmBinary,
-    },
-    host,
-    memory::Memory,
-    merkle::{Merkle, MerkleType},
-    programs::{config::CompileConfig, meter::MeteredMachine, ModuleMod, StylusData},
-    reinterpret::{ReinterpretAsSigned, ReinterpretAsUnsigned},
-    utils::{file_bytes, CBytes, RemoteTableType},
-    value::{ArbValueType, FunctionType, IntegerValType, ProgramCounter, Value},
-    wavm::{
-        self, pack_cross_module_call, unpack_cross_module_call, wasm_to_wavm, FloatingPointImpls,
-        IBinOpType, IRelOpType, IUnOpType, Instruction, Opcode,
-    },
-};
-use arbutil::{crypto, math, Bytes32, Color, DebugColor, PreimageType};
-use brotli::Dictionary;
-#[cfg(feature = "native")]
-use c_kzg::BYTES_PER_BLOB;
-use digest::Digest;
-use eyre::{bail, ensure, eyre, Result, WrapErr};
-use fnv::FnvHashMap as HashMap;
-use lazy_static::lazy_static;
-use num::{traits::PrimInt, Zero};
-use serde::{Deserialize, Serialize};
-use serde_with::serde_as;
-use sha3::Keccak256;
-use smallvec::SmallVec;
-
 #[cfg(feature = "counters")]
 use std::sync::atomic::{AtomicUsize, Ordering};
-
 use std::{
     borrow::Cow,
     convert::{TryFrom, TryInto},
@@ -43,17 +10,49 @@ use std::{
     fs::File,
     hash::Hash,
     io::{BufReader, BufWriter, Write},
-    num::Wrapping,
-    ops::Add,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-use wasmer_types::FunctionIndex;
-use wasmparser::{DataKind, ElementItems, ElementKind, Operator, RefType, TableType};
-
+use arbutil::{Bytes32, Color, DebugColor, PreimageType, crypto, math};
+use brotli::Dictionary;
+use eyre::{Result, WrapErr, bail, ensure, eyre};
+use fnv::FnvHashMap as HashMap;
+use lazy_static::lazy_static;
 #[cfg(feature = "rayon")]
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+use serde_with::serde_as;
+use smallvec::SmallVec;
+use tiny_keccak::{Hasher, Keccak};
+use wasmer_types::FunctionIndex;
+use wasmparser::{DataKind, ElementItems, ElementKind, Operator, RefType, TableType};
+#[cfg(feature = "native")]
+use {
+    crate::{
+        kzg::prove_kzg_preimage,
+        programs::meter::MeteredMachine,
+        reinterpret::{ReinterpretAsSigned, ReinterpretAsUnsigned},
+        value::IntegerValType,
+        wavm::{IBinOpType, IRelOpType, IUnOpType, unpack_cross_module_call},
+    },
+    c_kzg::BYTES_PER_BLOB,
+    num::{Zero, traits::PrimInt},
+    std::{num::Wrapping, ops::Add},
+};
+
+use crate::{
+    binary::{
+        self, ExportKind, ExportMap, FloatInstruction, Local, NameCustomSection, WasmBinary, parse,
+    },
+    host,
+    memory::Memory,
+    merkle::{Merkle, MerkleType},
+    programs::{ModuleMod, StylusData, config::CompileConfig},
+    utils::{CBytes, RemoteTableType, file_bytes},
+    value::{ArbValueType, FunctionType, ProgramCounter, Value},
+    wavm::{self, FloatingPointImpls, Instruction, Opcode, pack_cross_module_call, wasm_to_wavm},
+};
 
 #[cfg(feature = "counters")]
 static GET_MODULES_MERKLE_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -72,11 +71,11 @@ pub fn reset_counters() {
 }
 
 fn hash_call_indirect_data(table: u32, ty: &FunctionType) -> Bytes32 {
-    let mut h = Keccak256::new();
-    h.update("Call indirect:");
-    h.update((table as u64).to_be_bytes());
-    h.update(ty.hash());
-    h.finalize().into()
+    crypto::keccak_seq(&[
+        b"Call indirect:",
+        &(table as u64).to_be_bytes(),
+        ty.hash().as_ref(),
+    ])
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -167,6 +166,7 @@ impl Function {
         func
     }
 
+    #[cfg(feature = "native")]
     const CHUNK_SIZE: usize = 64;
 
     fn set_code_merkle(&mut self) {
@@ -183,6 +183,7 @@ impl Function {
         self.code_merkle = Merkle::new(MerkleType::Instruction, code_hashes);
     }
 
+    #[cfg(feature = "native")]
     fn serialize_body_for_proof(&self, pc: ProgramCounter) -> Vec<u8> {
         let start = pc.inst() / 64 * 64;
         let end = (start + 64).min(self.code.len());
@@ -190,10 +191,7 @@ impl Function {
     }
 
     fn hash(&self) -> Bytes32 {
-        let mut h = Keccak256::new();
-        h.update("Function:");
-        h.update(self.code_merkle.root());
-        h.finalize().into()
+        crypto::keccak_seq(&[b"Function:", self.code_merkle.root().as_ref()])
     }
 }
 
@@ -207,21 +205,21 @@ struct StackFrame {
 
 impl StackFrame {
     fn hash(&self) -> Bytes32 {
-        let mut h = Keccak256::new();
-        h.update("Stack frame:");
-        h.update(self.return_ref.hash());
-        h.update(
+        crypto::keccak_seq(&[
+            b"Stack frame:",
+            self.return_ref.hash().as_ref(),
             Merkle::new(
                 MerkleType::Value,
                 self.locals.iter().map(|v| v.hash()).collect(),
             )
-            .root(),
-        );
-        h.update(self.caller_module.to_be_bytes());
-        h.update(self.caller_module_internals.to_be_bytes());
-        h.finalize().into()
+            .root()
+            .as_ref(),
+            &self.caller_module.to_be_bytes(),
+            &self.caller_module_internals.to_be_bytes(),
+        ])
     }
 
+    #[cfg(feature = "native")]
     fn serialize_for_proof(&self) -> Vec<u8> {
         let mut data = Vec::new();
         data.extend(self.return_ref.serialize_for_proof());
@@ -255,11 +253,11 @@ impl Default for TableElement {
 
 impl TableElement {
     fn hash(&self) -> Bytes32 {
-        let mut h = Keccak256::new();
-        h.update("Table element:");
-        h.update(self.func_ty.hash());
-        h.update(self.val.hash());
-        h.finalize().into()
+        crypto::keccak_seq(&[
+            b"Table element:",
+            self.func_ty.hash().as_ref(),
+            self.val.hash().as_ref(),
+        ])
     }
 }
 
@@ -274,6 +272,7 @@ pub(crate) struct Table {
 }
 
 impl Table {
+    #[cfg(feature = "native")]
     fn serialize_for_proof(&self) -> Result<Vec<u8>> {
         let mut data = vec![ArbValueType::try_from(self.ty.element_type)?.serialize()];
         data.extend((self.elems.len() as u64).to_be_bytes());
@@ -282,12 +281,12 @@ impl Table {
     }
 
     fn hash(&self) -> Result<Bytes32> {
-        let mut h = Keccak256::new();
-        h.update("Table:");
-        h.update([ArbValueType::try_from(self.ty.element_type)?.serialize()]);
-        h.update((self.elems.len() as u64).to_be_bytes());
-        h.update(self.elems_merkle.root());
-        Ok(h.finalize().into())
+        Ok(crypto::keccak_seq(&[
+            b"Table:",
+            &[ArbValueType::try_from(self.ty.element_type)?.serialize()],
+            &(self.elems.len() as u64).to_be_bytes(),
+            self.elems_merkle.root().as_ref(),
+        ]))
     }
 }
 
@@ -334,7 +333,7 @@ lazy_static! {
     static ref USER_IMPORTS: HashMap<String, AvailableImport> = {
         let mut imports = HashMap::default();
 
-        let forward = include_bytes!(concat!(env!("OUT_DIR"), "/forward_stub.wat"));
+        let forward = include_bytes!("forward_stub.wat");
         let forward = wat::parse_bytes(forward).unwrap();
         let forward = binary::parse(&forward, Path::new("forward")).unwrap();
 
@@ -398,26 +397,35 @@ impl Module {
                     Instruction::simple(Opcode::Return),
                 ];
                 Function::new_from_wavm(wavm, import.ty.clone(), vec![])
-            } else if let Ok((hostio, debug)) = host::get_impl(import.module, import_name) {
-                ensure!(
-                    (debug && debug_funcs) || (!debug && allow_hostapi),
-                    "Host func {} in {} not enabled debug_funcs={debug_funcs} hostapi={allow_hostapi} debug={debug}",
-                    import_name.red(),
-                    import.module.red(),
-                );
-                hostio
             } else {
-                bail!(
-                    "No such import {} in {} for {}",
-                    import_name.red(),
-                    import.module.red(),
-                    bin_name.red()
-                )
+                match host::get_impl(import.module, import_name) {
+                    Ok((hostio, debug)) => {
+                        ensure!(
+                            (debug && debug_funcs) || (!debug && allow_hostapi),
+                            "Host func {} in {} not enabled debug_funcs={debug_funcs} hostapi={allow_hostapi} debug={debug}",
+                            import_name.red(),
+                            import.module.red(),
+                        );
+                        hostio
+                    }
+                    _ => {
+                        bail!(
+                            "No such import {} in {} for {}",
+                            import_name.red(),
+                            import.module.red(),
+                            bin_name.red()
+                        )
+                    }
+                }
             };
             ensure!(
                 &func.ty == have_ty,
                 "Import {} for {} has different function signature than export.\nexpected {} in {}\nbut have {}",
-                import_name.red(), bin_name.red(), func.ty.red(), module.red(), have_ty.red(),
+                import_name.red(),
+                bin_name.red(),
+                func.ty.red(),
+                module.red(),
+                have_ty.red(),
             );
 
             func_type_idxs.push(import.offset);
@@ -480,7 +488,7 @@ impl Module {
         if let Some(limits) = bin.memories.first() {
             let page_size = Memory::PAGE_SIZE;
             let initial = limits.initial; // validate() checks this is less than max::u32
-            let allowed = u32::MAX as u64 / Memory::PAGE_SIZE - 1; // we require the size remain *below* 2^32
+            let allowed = Memory::MAX_WASM_PAGES;
 
             let max_size = match limits.maximum {
                 Some(pages) => u64::min(allowed, pages),
@@ -499,7 +507,7 @@ impl Module {
         }
 
         for data in &bin.datas {
-            let (memory_index, mut init) = match data.kind {
+            let (memory_index, mut init) = match &data.kind {
                 DataKind::Active {
                     memory_index,
                     offset_expr,
@@ -507,7 +515,7 @@ impl Module {
                 _ => continue,
             };
             ensure!(
-                memory_index == 0,
+                *memory_index == 0,
                 "Attempted to write to nonexistant memory"
             );
 
@@ -542,7 +550,7 @@ impl Module {
         }
 
         for elem in &bin.elements {
-            let (t, mut init) = match elem.kind {
+            let (t, mut init) = match &elem.kind {
                 ElementKind::Active {
                     table_index,
                     offset_expr,
@@ -640,23 +648,23 @@ impl Module {
     }
 
     pub fn hash(&self) -> Bytes32 {
-        let mut h = Keccak256::new();
-        h.update("Module:");
-        h.update(
+        crypto::keccak_seq(&[
+            b"Module:",
             Merkle::new(
                 MerkleType::Value,
                 self.globals.iter().map(|v| v.hash()).collect(),
             )
-            .root(),
-        );
-        h.update(self.memory.hash());
-        h.update(self.tables_merkle.root());
-        h.update(self.funcs_merkle.root());
-        h.update(*self.extra_hash);
-        h.update(self.internals_offset.to_be_bytes());
-        h.finalize().into()
+            .root()
+            .as_ref(),
+            self.memory.hash().as_ref(),
+            self.tables_merkle.root().as_ref(),
+            self.funcs_merkle.root().as_ref(),
+            (*self.extra_hash).as_ref(),
+            &self.internals_offset.to_be_bytes(),
+        ])
     }
 
+    #[cfg(feature = "native")]
     fn serialize_for_proof(&self, mem_merkle: &Merkle) -> Vec<u8> {
         let mut data = Vec::new();
 
@@ -680,7 +688,8 @@ impl Module {
     }
 
     /// Serializes the `Module` into bytes that can be stored in the db.
-    /// The format employed is forward-compatible with future brotli dictionary and caching policies.
+    /// The format employed is forward-compatible with future brotli dictionary and caching
+    /// policies.
     pub fn into_bytes(&self) -> Vec<u8> {
         let data = bincode::serialize::<ModuleSerdeAll>(&self.into()).unwrap();
         let header = vec![1 + Into::<u8>::into(Dictionary::Empty)];
@@ -801,12 +810,14 @@ impl From<Function> for FunctionSerdeAll {
     }
 }
 
-// Globalstate holds:
+// GlobalState holds:
 // bytes32 - last_block_hash
 // bytes32 - send_root
+// bytes32 - mel_state_hash
+// bytes32 - mel_message_hash
 // uint64 - inbox_position
 // uint64 - position_within_message
-pub const GLOBAL_STATE_BYTES32_NUM: usize = 2;
+pub const GLOBAL_STATE_BYTES32_NUM: usize = 4;
 pub const GLOBAL_STATE_U64_NUM: usize = 2;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -816,28 +827,63 @@ pub struct GlobalState {
     pub u64_vals: [u64; GLOBAL_STATE_U64_NUM],
 }
 
+impl From<GlobalState> for validation::GoGlobalState {
+    fn from(gs: GlobalState) -> Self {
+        Self {
+            block_hash: gs.bytes32_vals[0],
+            send_root: gs.bytes32_vals[1],
+            batch: gs.u64_vals[0],
+            pos_in_batch: gs.u64_vals[1],
+        }
+    }
+}
+
 impl GlobalState {
     fn hash(&self) -> Bytes32 {
-        let mut h = Keccak256::new();
-        h.update("Global state:");
-        for item in self.bytes32_vals {
-            h.update(item)
+        let mut h = Keccak::v256();
+        h.update(b"Global state:");
+        let end_idx = self.bytes32_last_non_zero_index();
+        for i in 0..=end_idx {
+            h.update(self.bytes32_vals[i].as_ref());
         }
         for item in self.u64_vals {
-            h.update(item.to_be_bytes())
+            h.update(&item.to_be_bytes());
         }
-        h.finalize().into()
+        let mut out = [0u8; 32];
+        h.finalize(&mut out);
+        out.into()
     }
 
+    #[cfg(feature = "native")]
     fn serialize(&self) -> Vec<u8> {
         let mut data = Vec::new();
-        for item in self.bytes32_vals {
-            data.extend(item)
+        let end_idx = self.bytes32_last_non_zero_index();
+        for i in 0..=end_idx {
+            data.extend(self.bytes32_vals[i]);
         }
         for item in self.u64_vals {
             data.extend(item.to_be_bytes())
         }
         data
+    }
+    /// Returns the index of the last non-zero bytes32 value, or 1 if all values
+    /// past index 1 are zero (and 1 also when every value is zero). Always
+    /// returns at least 1, so the first two slots (block_hash, send_root) are
+    /// always serialized — preserving the pre-MEL GlobalState hash format for
+    /// backwards compatibility.
+    fn bytes32_last_non_zero_index(&self) -> usize {
+        let last_non_zero_idx = self
+            .bytes32_vals
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|&(_, &val)| val != Bytes32::default())
+            .map(|(i, _)| i);
+
+        match last_non_zero_idx {
+            Some(idx) => std::cmp::max(1, idx),
+            None => 1,
+        }
     }
 }
 
@@ -932,6 +978,7 @@ pub type PreimageResolver = Arc<dyn Fn(u64, PreimageType, Bytes32) -> Option<CBy
 #[derive(Clone)]
 struct PreimageResolverWrapper {
     resolver: PreimageResolver,
+    #[cfg(feature = "native")]
     last_resolved: Option<(Bytes32, CBytes)>,
 }
 
@@ -945,6 +992,7 @@ impl PreimageResolverWrapper {
     pub fn new(resolver: PreimageResolver) -> PreimageResolverWrapper {
         PreimageResolverWrapper {
             resolver,
+            #[cfg(feature = "native")]
             last_resolved: None,
         }
     }
@@ -967,10 +1015,10 @@ impl PreimageResolverWrapper {
 
     #[cfg(feature = "native")]
     pub fn get_const(&self, context: u64, ty: PreimageType, hash: Bytes32) -> Option<CBytes> {
-        if let Some(resolved) = &self.last_resolved {
-            if resolved.0 == hash {
-                return Some(resolved.1.clone());
-            }
+        if let Some(resolved) = &self.last_resolved
+            && resolved.0 == hash
+        {
+            return Some(resolved.1.clone());
         }
         (self.resolver)(context, ty, hash)
     }
@@ -992,6 +1040,7 @@ pub struct Machine {
     inbox_contents: HashMap<(InboxIdentifier, u64), Vec<u8>>,
     first_too_far: u64, // Not part of machine hash
     preimage_resolver: PreimageResolverWrapper,
+    end_parent_chain_block_hash: Bytes32, // Used for MEL proving.
     /// Linkable Stylus modules in compressed form. Not part of the machine hash.
     stylus_modules: HashMap<Bytes32, Vec<u8>>,
     initial_hash: Bytes32,
@@ -1031,14 +1080,7 @@ where
             heights = &heights[1..];
         }
 
-        use digest::Update;
-
-        hash = Keccak256::new()
-            .chain(prefix)
-            .chain(item.as_ref())
-            .chain(hash)
-            .finalize()
-            .into();
+        hash = crypto::keccak_seq(&[prefix.as_bytes(), item.as_ref(), hash.as_ref()]);
 
         count += 1;
     }
@@ -1261,7 +1303,7 @@ impl Machine {
             inbox_contents,
             preimage_resolver,
             None,
-            0,
+            0, // version only applies to user (Stylus) modules, not system libraries
         )
     }
 
@@ -1299,8 +1341,9 @@ impl Machine {
         Ok(machine)
     }
 
-    /// Adds a user program to the machine's known set of wasms, compiling it into a link-able module.
-    /// Note that the module produced will need to be configured before execution via hostio calls.
+    /// Adds a user program to the machine's known set of wasms, compiling it into a link-able
+    /// module. Note that the module produced will need to be configured before execution via
+    /// hostio calls.
     pub fn add_program(
         &mut self,
         wasm: &[u8],
@@ -1387,7 +1430,7 @@ impl Machine {
                 true,
                 debug_funcs,
                 None,
-                0,
+                0, // version only applies to user (Stylus) modules, not system libraries
             )?;
             for (name, &func) in &*module.func_exports {
                 let ty = module.func_types[func as usize].clone();
@@ -1414,7 +1457,8 @@ impl Machine {
             modules.push(module);
         }
 
-        // Shouldn't be necessary, but to be safe, don't allow the main binary to import its own guest calls
+        // Shouldn't be necessary, but to be safe, don't allow the main binary to import its own
+        // guest calls
         available_imports.retain(|_, i| i.module as usize != modules.len());
         modules.push(Module::from_binary(
             &bin,
@@ -1432,13 +1476,13 @@ impl Machine {
             ($opcode:ident) => {
                 entrypoint.push(Instruction::simple(Opcode::$opcode));
             };
-            ($opcode:ident, $value:expr) => {
+            ($opcode:ident, $value:expr_2021) => {
                 entrypoint.push(Instruction::with_data(Opcode::$opcode, $value));
             };
-            ($opcode:ident ($inside:expr)) => {
+            ($opcode:ident ($inside:expr_2021)) => {
                 entrypoint.push(Instruction::simple(Opcode::$opcode($inside)));
             };
-            (@cross, $module:expr, $func:expr) => {
+            (@cross, $module:expr_2021, $func:expr_2021) => {
                 entrypoint.push(Instruction::with_data(
                     Opcode::CrossModuleCall,
                     pack_cross_module_call($module, $func),
@@ -1569,6 +1613,7 @@ impl Machine {
             preimage_resolver: PreimageResolverWrapper::new(preimage_resolver),
             stylus_modules: HashMap::default(),
             initial_hash: Bytes32::default(),
+            end_parent_chain_block_hash: Bytes32::default(),
             context: 0,
             debug_info,
         };
@@ -1602,6 +1647,7 @@ impl Machine {
             stylus_modules: Default::default(),
             initial_hash: Default::default(),
             context: Default::default(),
+            end_parent_chain_block_hash: Default::default(),
             debug_info: Default::default(),
         }
     }
@@ -1655,6 +1701,7 @@ impl Machine {
             preimage_resolver: PreimageResolverWrapper::new(get_empty_preimage_resolver()),
             stylus_modules: HashMap::default(),
             initial_hash: Bytes32::default(),
+            end_parent_chain_block_hash: Bytes32::default(),
             context: 0,
             debug_info: false,
         };
@@ -1709,14 +1756,16 @@ impl Machine {
         Ok(())
     }
 
-    // Requires that this is the same base machine. If this returns an error, it has not mutated `self`.
+    // Requires that this is the same base machine. If this returns an error, it has not mutated
+    // `self`.
     pub fn deserialize_and_replace_state<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
         let reader = BufReader::new(File::open(path)?);
         let new_state: MachineState = bincode::deserialize_from(reader)?;
         if self.initial_hash != new_state.initial_hash {
             bail!(
                 "attempted to load deserialize machine with initial hash {} into machine with initial hash {}",
-                new_state.initial_hash, self.initial_hash,
+                new_state.initial_hash,
+                self.initial_hash,
             );
         }
         assert_eq!(self.modules.len(), new_state.modules.len());
@@ -1979,7 +2028,7 @@ impl Machine {
             () => {
                 error!("")
             };
-            ($format:expr $(, $message:expr)*) => {{
+            ($format:expr_2021 $(, $message:expr_2021)*) => {{
                 if self.debug_info {
                     println!("\n{} {}", "error on line".grey(), line!().pink());
                     println!($format, $($message.pink()),*);
@@ -2035,19 +2084,18 @@ impl Machine {
                         .host_call_hooks
                         .get(self.pc.func())
                         .and_then(|h| h.as_ref())
-                    {
-                        if let Err(err) = Self::host_call_hook(
+                        && let Err(err) = Self::host_call_hook(
                             value_stack,
                             module,
                             &mut self.stdio_output,
                             &hook.0,
                             &hook.1,
-                        ) {
-                            eprintln!(
-                                "Failed to process host call hook for host call {:?} {:?}: {err}",
-                                hook.0, hook.1,
-                            );
-                        }
+                        )
+                    {
+                        eprintln!(
+                            "Failed to process host call hook for host call {:?} {:?}: {err}",
+                            hook.0, hook.1,
+                        );
                     }
                 }
                 Opcode::ArbitraryJump => {
@@ -2476,6 +2524,15 @@ impl Machine {
                         self.global_state.u64_vals[idx] = val
                     }
                 }
+                Opcode::GetEndParentChainBlockHash => {
+                    let ptr = value_stack.pop().unwrap().assume_u32();
+                    if !module
+                        .memory
+                        .store_slice_aligned(ptr.into(), &*self.end_parent_chain_block_hash)
+                    {
+                        error!();
+                    }
+                }
                 Opcode::ValidateCertificate => {
                     let preimage_type = value_stack.pop().unwrap().assume_u32();
                     let hash_ptr = value_stack.pop().unwrap().assume_u32();
@@ -2668,7 +2725,7 @@ impl Machine {
         name: &str,
     ) -> Result<()> {
         macro_rules! pull_arg {
-            ($offset:expr, $t:ident) => {
+            ($offset:expr_2021, $t:ident) => {
                 value_stack
                     .get(value_stack.len().wrapping_sub($offset + 1))
                     .and_then(|v| match v {
@@ -2679,7 +2736,7 @@ impl Machine {
             };
         }
         macro_rules! read_u32_ptr {
-            ($ptr:expr) => {
+            ($ptr:expr_2021) => {
                 module
                     .memory
                     .get_u32($ptr.into())
@@ -2687,7 +2744,7 @@ impl Machine {
             };
         }
         macro_rules! read_bytes_segment {
-            ($ptr:expr, $size:expr) => {
+            ($ptr:expr_2021, $size:expr_2021) => {
                 module
                     .memory
                     .get_range($ptr as usize, $size as usize)
@@ -2795,7 +2852,7 @@ impl Machine {
 
     fn stack_hashes(&self) -> (FrameStackHash, ValueStackHash, InterStackHash) {
         macro_rules! compute {
-            ($stack:expr, $prefix:expr) => {{
+            ($stack:expr_2021, $prefix:expr_2021) => {{
                 let frames = $stack.iter().map(|v| v.hash());
                 hash_stack(frames, concat!($prefix, " stack:"))
             }};
@@ -2808,7 +2865,7 @@ impl Machine {
         //      + Keccak("cothread:" + 2nd_stack+Keccak("cothread:" + 3drd_stack + ...)
         // )
         macro_rules! compute_multistack {
-            ($field:expr, $stacks:expr, $prefix:expr, $hasher: expr) => {{
+            ($field:expr_2021, $stacks:expr_2021, $prefix:expr_2021, $hasher: expr_2021) => {{
                 let first_elem = *$stacks.first().unwrap();
                 let first_hash = hash_stack(
                     first_elem.iter().map(|v| v.hash()),
@@ -2832,18 +2889,15 @@ impl Machine {
                     hash_multistack(&$stacks[1..$stacks.len() - 1], $hasher)
                 };
 
-                hash = Keccak256::new()
-                    .chain("multistack:")
-                    .chain(first_hash)
-                    .chain(last_hash)
-                    .chain(hash)
-                    .finalize()
-                    .into();
+                hash = crypto::keccak_seq(&[
+                    b"multistack:",
+                    first_hash.as_ref(),
+                    last_hash.as_ref(),
+                    hash.as_ref(),
+                ]);
                 hash
             }};
         }
-
-        use digest::Update;
         let frame_stacks = compute_multistack!(
             |x| x.frame_stack,
             self.get_frame_stacks(),
@@ -2862,34 +2916,28 @@ impl Machine {
     }
 
     pub fn hash(&self) -> Bytes32 {
-        let mut h = Keccak256::new();
         match self.status {
             MachineStatus::Running => {
                 let (frame_stacks, value_stacks, inter_stack) = self.stack_hashes();
-
-                h.update(b"Machine running:");
-                h.update(value_stacks);
-                h.update(inter_stack);
-                h.update(frame_stacks);
-                h.update(self.global_state.hash());
-                h.update(self.pc.module.to_be_bytes());
-                h.update(self.pc.func.to_be_bytes());
-                h.update(self.pc.inst.to_be_bytes());
-                h.update(self.thread_state.serialize());
-                h.update(self.get_modules_root());
+                crypto::keccak_seq(&[
+                    b"Machine running:",
+                    value_stacks.as_ref(),
+                    inter_stack.as_ref(),
+                    frame_stacks.as_ref(),
+                    self.global_state.hash().as_ref(),
+                    &self.pc.module.to_be_bytes(),
+                    &self.pc.func.to_be_bytes(),
+                    &self.pc.inst.to_be_bytes(),
+                    self.thread_state.serialize().as_ref(),
+                    self.get_modules_root().as_ref(),
+                ])
             }
             MachineStatus::Finished => {
-                h.update("Machine finished:");
-                h.update(self.global_state.hash());
+                crypto::keccak_seq(&[b"Machine finished:", self.global_state.hash().as_ref()])
             }
-            MachineStatus::Errored => {
-                h.update("Machine errored:");
-            }
-            MachineStatus::TooFar => {
-                h.update("Machine too far:");
-            }
+            MachineStatus::Errored => crypto::keccak_seq(&[b"Machine errored:"]),
+            MachineStatus::TooFar => crypto::keccak_seq(&[b"Machine too far:"]),
         }
-        h.finalize().into()
     }
 
     #[cfg(feature = "native")]
@@ -2900,12 +2948,12 @@ impl Machine {
         let mut data = vec![self.status as u8];
 
         macro_rules! out {
-            ($bytes:expr) => {
+            ($bytes:expr_2021) => {
                 data.extend($bytes);
             };
         }
         macro_rules! fail {
-            ($format:expr $(,$message:expr)*) => {{
+            ($format:expr_2021 $(,$message:expr_2021)*) => {{
                 let text = format!($format, $($message.red()),*);
                 panic!("WASM validation failed: {text}");
             }};
@@ -2966,9 +3014,11 @@ impl Machine {
 
         // Prove module is in modules merkle tree
 
-        out!(mod_merkle
-            .prove(self.pc.module())
-            .expect("Failed to prove module"));
+        out!(
+            mod_merkle
+                .prove(self.pc.module())
+                .expect("Failed to prove module")
+        );
 
         if self.is_halted() {
             return data;
@@ -2978,14 +3028,17 @@ impl Machine {
 
         let func = &module.funcs[self.pc.func()];
         out!(func.serialize_body_for_proof(self.pc));
-        out!(func
-            .code_merkle
-            .prove(self.pc.inst() / Function::CHUNK_SIZE)
-            .expect("Failed to prove against code merkle"));
-        out!(module
-            .funcs_merkle
-            .prove(self.pc.func())
-            .expect("Failed to prove against function merkle"));
+        out!(
+            func.code_merkle
+                .prove(self.pc.inst() / Function::CHUNK_SIZE)
+                .expect("Failed to prove against code merkle")
+        );
+        out!(
+            module
+                .funcs_merkle
+                .prove(self.pc.func())
+                .expect("Failed to prove against function merkle")
+        );
 
         // End next instruction proof, begin instruction specific serialization
 
@@ -3036,7 +3089,8 @@ impl Machine {
                     .checked_add(arg)
                     .and_then(|x| usize::try_from(x).ok())
                 {
-                    // Prove the leaf this index is in, and the next one, if they are within the memory's size.
+                    // Prove the leaf this index is in, and the next one, if they are within the
+                    // memory's size.
                     idx /= Memory::LEAF_SIZE;
                     out!(module.memory.get_leaf_data(idx));
                     out!(mem_merkle.prove(idx).unwrap_or_default());
@@ -3044,8 +3098,9 @@ impl Machine {
                     let next_leaf_idx = idx.saturating_add(1);
                     out!(module.memory.get_leaf_data(next_leaf_idx));
                     let second_mem_merkle = if is_store {
-                        // For stores, prove the second merkle against a state after the first leaf is set.
-                        // This state also happens to have the second leaf set, but that's irrelevant.
+                        // For stores, prove the second merkle against a state after the first leaf
+                        // is set. This state also happens to have the
+                        // second leaf set, but that's irrelevant.
                         let mut copy = self.clone();
                         copy.step_n(1)
                             .expect("Failed to step machine forward for proof");
@@ -3070,30 +3125,38 @@ impl Machine {
                 out!(ty.hash());
                 let table_usize = usize::try_from(table).unwrap();
                 let table = &module.tables[table_usize];
-                out!(table
-                    .serialize_for_proof()
-                    .expect("failed to serialize table"));
-                out!(module
-                    .tables_merkle
-                    .prove(table_usize)
-                    .expect("Failed to prove tables merkle"));
+                out!(
+                    table
+                        .serialize_for_proof()
+                        .expect("failed to serialize table")
+                );
+                out!(
+                    module
+                        .tables_merkle
+                        .prove(table_usize)
+                        .expect("Failed to prove tables merkle")
+                );
                 let idx_usize = usize::try_from(idx).unwrap();
                 if let Some(elem) = table.elems.get(idx_usize) {
                     out!(elem.func_ty.hash());
                     out!(elem.val.serialize_for_proof());
-                    out!(table
-                        .elems_merkle
-                        .prove(idx_usize)
-                        .expect("Failed to prove elements merkle"));
+                    out!(
+                        table
+                            .elems_merkle
+                            .prove(idx_usize)
+                            .expect("Failed to prove elements merkle")
+                    );
                 }
             }
             CrossModuleInternalCall => {
                 let module_idx = value_stack.last().unwrap().assume_u32() as usize;
                 let called_module = &self.modules[module_idx];
                 out!(called_module.serialize_for_proof(&called_module.memory.merkelize()));
-                out!(mod_merkle
-                    .prove(module_idx)
-                    .expect("Failed to prove module for CrossModuleInternalCall"));
+                out!(
+                    mod_merkle
+                        .prove(module_idx)
+                        .expect("Failed to prove module for CrossModuleInternalCall")
+                );
             }
             GetGlobalStateBytes32 | SetGlobalStateBytes32 => {
                 out!(self.global_state.serialize());
@@ -3139,8 +3202,9 @@ impl Machine {
                             }
                             PreimageType::DACertificate => {
                                 // We do something special here; we don't create the final proof.
-                                // For DACertificate preimages, signal that this proof needs enhancement
-                                // Set the enhancement flag (0x80) on the machine status byte.
+                                // For DACertificate preimages, signal that this proof needs
+                                // enhancement Set the enhancement
+                                // flag (0x80) on the machine status byte.
                                 data[0] |= 0x80;
 
                                 // Append hash and offset for the enhancer to use
@@ -3195,7 +3259,7 @@ impl Machine {
             }
             PopCoThread => {
                 macro_rules! prove_pop {
-                    ($multistack:expr, $hasher:expr) => {
+                    ($multistack:expr_2021, $hasher:expr_2021) => {
                         let len = $multistack.len();
                         if (len > 2) {
                             out!($hasher($multistack[len - 2]));
@@ -3213,7 +3277,8 @@ impl Machine {
                 prove_pop!(self.get_frame_stacks(), hash_stack_frame_stack);
             }
             ValidateCertificate => {
-                // ValidateCertificate reads a hash from memory, so we need to prove that memory access
+                // ValidateCertificate reads a hash from memory, so we need to prove that memory
+                // access
                 let ptr = value_stack.get(value_stack.len() - 2).unwrap().assume_u32();
                 if let Some(mut idx) = usize::try_from(ptr).ok().filter(|x| x % 32 == 0) {
                     // Prove the leaf this index is in
@@ -3227,23 +3292,22 @@ impl Machine {
                 if let Ok(preimage_ty) = PreimageType::try_from(
                     u8::try_from(preimage_type)
                         .expect("ValidateCertificate preimage_type is out of range for u8"),
-                ) {
-                    if preimage_ty == PreimageType::DACertificate {
-                        // We do something special here; we don't create the final proof.
-                        // For DACertificate preimages, signal that this proof needs enhancement
-                        // Set the enhancement flag (0x80) on the machine status byte.
-                        data[0] |= 0x80;
+                ) && preimage_ty == PreimageType::DACertificate
+                {
+                    // We do something special here; we don't create the final proof.
+                    // For DACertificate preimages, signal that this proof needs enhancement
+                    // Set the enhancement flag (0x80) on the machine status byte.
+                    data[0] |= 0x80;
 
-                        // Load the hash from memory
-                        if let Some(hash) = module.memory.load_32_byte_aligned(ptr.into()) {
-                            // Append hash for the enhancer to use
-                            data.extend(hash.0);
+                    // Load the hash from memory
+                    if let Some(hash) = module.memory.load_32_byte_aligned(ptr.into()) {
+                        // Append hash for the enhancer to use
+                        data.extend(hash.0);
 
-                            // Append marker to identify this as DACertificate ValidateCertificate
-                            data.push(0xDB);
-                            // The enhancement flag and marker data will be stripped out of
-                            // the proof by the enhancer.
-                        }
+                        // Append marker to identify this as DACertificate ValidateCertificate
+                        data.push(0xDB);
+                        // The enhancement flag and marker data will be stripped out of
+                        // the proof by the enhancer.
                     }
                 }
             }
@@ -3287,6 +3351,10 @@ impl Machine {
 
     pub fn set_global_state(&mut self, gs: GlobalState) {
         self.global_state = gs;
+    }
+
+    pub fn set_end_parent_chain_block_hash(&mut self, hash: Bytes32) {
+        self.end_parent_chain_block_hash = hash;
     }
 
     pub fn set_preimage_resolver(&mut self, resolver: PreimageResolver) {
@@ -3346,5 +3414,117 @@ impl Machine {
         if frame_stack.len() > 25 {
             print(format!("  ... and {} more", frame_stack.len() - 25).grey());
         }
+    }
+}
+
+#[cfg(test)]
+mod global_state_hash_tests {
+    use super::*;
+
+    fn bytes32(byte: u8) -> Bytes32 {
+        let mut b = [0u8; 32];
+        b[0] = byte;
+        b.into()
+    }
+
+    // Recomputes hash() the way the pre-MEL 2-slot GlobalState did: always
+    // exactly two bytes32 followed by the u64 values. Every existing
+    // assertion proof was generated against this format, so hash() for a
+    // state with slots 2 and 3 zero must still match byte-for-byte.
+    fn legacy_two_slot_hash(gs: &GlobalState) -> Bytes32 {
+        let mut h = Keccak::v256();
+        h.update(b"Global state:");
+        h.update(gs.bytes32_vals[0].as_ref());
+        h.update(gs.bytes32_vals[1].as_ref());
+        for item in gs.u64_vals {
+            h.update(&item.to_be_bytes());
+        }
+        let mut out = [0u8; 32];
+        h.finalize(&mut out);
+        out.into()
+    }
+
+    // Recomputes hash() including all 4 bytes32 slots unconditionally. Used
+    // as the golden vector for states where slot 3 is non-zero (so all four
+    // slots must be serialized).
+    fn full_four_slot_hash(gs: &GlobalState) -> Bytes32 {
+        let mut h = Keccak::v256();
+        h.update(b"Global state:");
+        for v in gs.bytes32_vals {
+            h.update(v.as_ref());
+        }
+        for item in gs.u64_vals {
+            h.update(&item.to_be_bytes());
+        }
+        let mut out = [0u8; 32];
+        h.finalize(&mut out);
+        out.into()
+    }
+
+    #[test]
+    fn all_zeros_matches_legacy_two_slot_layout() {
+        let gs = GlobalState::default();
+        assert_eq!(gs.bytes32_last_non_zero_index(), 1);
+        assert_eq!(gs.serialize().len(), 2 * 32 + 2 * 8);
+        assert_eq!(gs.hash(), legacy_two_slot_hash(&gs));
+    }
+
+    #[test]
+    fn only_slot_0_set_matches_legacy() {
+        let mut gs = GlobalState::default();
+        gs.bytes32_vals[0] = bytes32(0xAA);
+        gs.u64_vals = [7, 11];
+        assert_eq!(gs.bytes32_last_non_zero_index(), 1);
+        assert_eq!(gs.serialize().len(), 2 * 32 + 2 * 8);
+        assert_eq!(gs.hash(), legacy_two_slot_hash(&gs));
+    }
+
+    #[test]
+    fn only_slot_1_set_matches_legacy() {
+        let mut gs = GlobalState::default();
+        gs.bytes32_vals[1] = bytes32(0xBB);
+        gs.u64_vals = [42, 0];
+        assert_eq!(gs.bytes32_last_non_zero_index(), 1);
+        assert_eq!(gs.serialize().len(), 2 * 32 + 2 * 8);
+        assert_eq!(gs.hash(), legacy_two_slot_hash(&gs));
+    }
+
+    #[test]
+    fn slot_2_set_extends_serialization_and_preserves_intermediate_zeros() {
+        let mut gs = GlobalState::default();
+        gs.bytes32_vals[0] = bytes32(0x01);
+        // intermediate slot 1 left zero on purpose
+        gs.bytes32_vals[2] = bytes32(0x03);
+        gs.u64_vals = [1, 2];
+        assert_eq!(gs.bytes32_last_non_zero_index(), 2);
+        let bytes = gs.serialize();
+        assert_eq!(bytes.len(), 3 * 32 + 2 * 8);
+        // slot 1 (the intermediate zero) must still be present in the prefix
+        assert_eq!(&bytes[32..64], &[0u8; 32]);
+        // and slot 2 should appear next
+        assert_eq!(&bytes[64..96], gs.bytes32_vals[2].as_slice());
+    }
+
+    #[test]
+    fn slot_3_set_serializes_all_four_slots() {
+        let mut gs = GlobalState::default();
+        gs.bytes32_vals[0] = bytes32(0x01);
+        gs.bytes32_vals[3] = bytes32(0x04);
+        gs.u64_vals = [5, 9];
+        assert_eq!(gs.bytes32_last_non_zero_index(), 3);
+        assert_eq!(gs.serialize().len(), 4 * 32 + 2 * 8);
+        assert_eq!(gs.hash(), full_four_slot_hash(&gs));
+    }
+
+    #[test]
+    fn padded_legacy_state_hashes_equal_unpadded_legacy_state() {
+        // {a, b, 0, 0} must hash identically to the pre-MEL {a, b} layout —
+        // this is the backwards-compatibility invariant that every existing
+        // on-chain assertion depends on.
+        let mut gs = GlobalState::default();
+        gs.bytes32_vals[0] = bytes32(0xDE);
+        gs.bytes32_vals[1] = bytes32(0xAD);
+        gs.u64_vals = [123, 456];
+        assert_eq!(gs.hash(), legacy_two_slot_hash(&gs));
     }
 }

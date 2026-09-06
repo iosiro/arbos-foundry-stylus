@@ -1,9 +1,6 @@
 // Copyright 2021-2026, Offchain Labs, Inc.
 // For license information, see https://github.com/OffchainLabs/nitro/blob/master/LICENSE.md
 
-use num_enum::{IntoPrimitive, TryFromPrimitive};
-use ruint2::Uint;
-use serde::{Deserialize, Serialize};
 use std::{
     borrow::Borrow,
     fmt,
@@ -11,8 +8,13 @@ use std::{
     str::FromStr,
 };
 
+use num_enum::{IntoPrimitive, TryFromPrimitive};
+use ruint2::Uint;
+use serde::{Deserialize, Serialize};
+
 // These values must be kept in sync with `arbutil/preimage_type.go`,
-// and the if statement in `contracts/src/osp/OneStepProverHostIo.sol` (search for "UNKNOWN_PREIMAGE_TYPE").
+// and the if statement in `contracts/src/osp/OneStepProverHostIo.sol` (search for
+// "UNKNOWN_PREIMAGE_TYPE").
 #[derive(
     Debug,
     Clone,
@@ -33,6 +35,19 @@ pub enum PreimageType {
     Sha2_256 = 1,
     EthVersionedHash = 2,
     DACertificate = 3,
+}
+
+impl FromStr for PreimageType {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "Keccak256" | "0" => Ok(PreimageType::Keccak256),
+            "Sha2_256" | "1" => Ok(PreimageType::Sha2_256),
+            "EthVersionedHash" | "2" => Ok(PreimageType::EthVersionedHash),
+            "DACertificate" | "3" => Ok(PreimageType::DACertificate),
+            _ => Err(format!("unknown preimage type: {s}")),
+        }
+    }
 }
 
 /// cbindgen:field-names=[bytes]
@@ -150,13 +165,13 @@ impl IntoIterator for Bytes32 {
 
 impl fmt::Display for Bytes32 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", hex::encode(self))
+        write!(f, "0x{}", hex::encode(self))
     }
 }
 
 impl fmt::Debug for Bytes32 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", hex::encode(self))
+        write!(f, "0x{}", hex::encode(self))
     }
 }
 

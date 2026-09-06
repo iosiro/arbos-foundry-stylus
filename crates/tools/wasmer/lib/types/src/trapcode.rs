@@ -14,21 +14,12 @@ use thiserror::Error;
 ///
 /// All trap instructions have an explicit trap code.
 #[derive(
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Debug,
-    Hash,
-    Error,
-    RkyvSerialize,
-    RkyvDeserialize,
-    Archive,
-    rkyv::CheckBytes,
+    Clone, Copy, PartialEq, Eq, Debug, Hash, Error, RkyvSerialize, RkyvDeserialize, Archive,
 )]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
+#[rkyv(derive(Debug), compare(PartialEq))]
 #[repr(u32)]
-#[archive(as = "Self")]
 pub enum TrapCode {
     /// The current stack space was exhausted.
     ///
@@ -70,8 +61,18 @@ pub enum TrapCode {
     /// An atomic memory access was attempted with an unaligned pointer.
     UnalignedAtomic = 10,
 
+    /// An exception was thrown but it was left uncaught.
+    UncaughtException = 11,
+
+    /// A throw_ref was executed but the exnref was not initialized.
+    UninitializedExnRef = 12,
+
+    /// An async imported function tried to yield when not called
+    /// via `Function::call_async`.
+    YieldOutsideAsyncContext = 13,
+
     /// A memory.fill instruction was given a value that exceeds 8 bits.
-    /// Assigned 255 to avoid conflicts with upstream Wasmer additions.
+    /// Assigned 255 to avoid conflicts with upstream wasmer additions.
     MemoryFillValueOverflow = 255,
 }
 
@@ -90,6 +91,11 @@ impl TrapCode {
             Self::BadConversionToInteger => "invalid conversion to integer",
             Self::UnreachableCodeReached => "unreachable",
             Self::UnalignedAtomic => "unaligned atomic access",
+            Self::UncaughtException => "uncaught exception",
+            Self::UninitializedExnRef => "uninitialized exnref",
+            Self::YieldOutsideAsyncContext => {
+                "async imported function yielded when not called via `Function::call_async`"
+            }
             Self::MemoryFillValueOverflow => "memory.fill value exceeds 8 bits",
         }
     }
@@ -109,6 +115,9 @@ impl Display for TrapCode {
             Self::BadConversionToInteger => "bad_toint",
             Self::UnreachableCodeReached => "unreachable",
             Self::UnalignedAtomic => "unalign_atom",
+            Self::UncaughtException => "uncaught_exception",
+            Self::UninitializedExnRef => "uninitialized_exnref",
+            Self::YieldOutsideAsyncContext => "yield_outside_async_context",
             Self::MemoryFillValueOverflow => "memfill_val_ovf",
         };
         f.write_str(identifier)
@@ -131,6 +140,9 @@ impl FromStr for TrapCode {
             "bad_toint" => Ok(Self::BadConversionToInteger),
             "unreachable" => Ok(Self::UnreachableCodeReached),
             "unalign_atom" => Ok(Self::UnalignedAtomic),
+            "uncaught_exception" => Ok(Self::UncaughtException),
+            "uninitialized_exnref" => Ok(Self::UninitializedExnRef),
+            "yield_outside_async_context" => Ok(Self::YieldOutsideAsyncContext),
             "memfill_val_ovf" => Ok(Self::MemoryFillValueOverflow),
             _ => Err(()),
         }
