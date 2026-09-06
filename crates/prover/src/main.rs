@@ -3,23 +3,26 @@
 
 #![cfg(feature = "native")]
 
-use arbutil::{format, Bytes32, Color, DebugColor, PreimageType};
-use eyre::{eyre, Context, Result};
+use std::{
+    convert::TryInto,
+    fs::File,
+    io::{BufReader, BufWriter, ErrorKind, Read, Write},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+use arbutil::{Bytes32, Color, DebugColor, PreimageType, format};
+use eyre::{Context, Result, eyre};
 use fnv::{FnvHashMap as HashMap, FnvHashSet as HashSet};
 use prover::{
     machine::{GlobalState, InboxIdentifier, Machine, MachineStatus, PreimageResolver, ProofInfo},
     prepare::prepare_machine,
-    utils::{file_bytes, hash_preimage, CBytes},
+    utils::{CBytes, file_bytes, hash_preimage},
     wavm::Opcode,
 };
-use std::sync::Arc;
-use std::{convert::TryInto, io::BufWriter};
-use std::{
-    fs::File,
-    io::{BufReader, ErrorKind, Read, Write},
-    path::{Path, PathBuf},
-};
+use serde::Deserialize;
 use structopt::StructOpt;
+use validation::GoGlobalState;
 
 #[derive(StructOpt)]
 #[structopt(name = "arbitrator-prover")]
@@ -70,6 +73,10 @@ struct Opts {
     #[structopt(long)]
     last_send_root: Option<String>,
     #[structopt(long)]
+    mel_state_root: Option<String>,
+    #[structopt(long)]
+    mel_msg_hash: Option<String>,
+    #[structopt(long)]
     inbox: Vec<PathBuf>,
     #[structopt(long)]
     delayed_inbox: Vec<PathBuf>,
@@ -87,6 +94,13 @@ struct Opts {
     skip_until_host_io: bool,
     #[structopt(long)]
     max_steps: Option<u64>,
+    /// Options for WAVM binary generation.
+    #[structopt(long, default_value = "module-root.txt")]
+    module_root_filename: String,
+    #[structopt(long, default_value = "machine.v2.wavm.br")]
+    brotli_wavm_machine_filename: String,
+    #[structopt(long, default_value = "until-host-io-state.bin")]
+    until_hostio_bin_filename: String,
     // JSON inputs supercede any of the command-line inputs which could
     // be specified in the JSON file.
     #[structopt(long)]
@@ -127,11 +141,12 @@ const DELAYED_HEADER_LEN: usize = 112; // also in test-case's host-io.rs & contr
 #[cfg(feature = "native")]
 fn main() -> Result<()> {
     let opts = Opts::from_args();
+    let expected_state = get_expected_state(&opts)?;
 
     if opts.print_wasmmoduleroot {
         match Machine::new_from_wavm(&opts.binary) {
             Ok(mach) => {
-                println!("0x{}", mach.get_modules_root());
+                println!("{}", mach.get_modules_root());
                 return Ok(());
             }
             Err(err) => {
@@ -156,15 +171,15 @@ fn main() -> Result<()> {
     }
 
     if let Some(output_path) = opts.generate_binaries {
-        let mut module_root_file = File::create(output_path.join("module-root.txt"))?;
-        writeln!(module_root_file, "0x{}", mach.get_modules_root())?;
+        let mut module_root_file = File::create(output_path.join(opts.module_root_filename))?;
+        writeln!(module_root_file, "{}", mach.get_modules_root())?;
         module_root_file.flush()?;
 
-        mach.serialize_binary(output_path.join("machine.wavm.br"))?;
+        mach.serialize_binary(output_path.join(opts.brotli_wavm_machine_filename))?;
         while !mach.next_instruction_is_host_io() {
             mach.step_n(1)?;
         }
-        mach.serialize_state(output_path.join("until-host-io-state.bin"))?;
+        mach.serialize_state(output_path.join(opts.until_hostio_bin_filename))?;
 
         return Ok(());
     }
@@ -194,10 +209,10 @@ fn main() -> Result<()> {
     }
     let mut skipping_profiling = opts.skip_until_host_io;
     while !mach.is_halted() {
-        if let Some(max_steps) = opts.max_steps {
-            if mach.get_steps() >= max_steps {
-                break;
-            }
+        if let Some(max_steps) = opts.max_steps
+            && mach.get_steps() >= max_steps
+        {
+            break;
         }
 
         let next_inst = mach.get_next_instruction().unwrap();
@@ -217,8 +232,9 @@ fn main() -> Result<()> {
             *count_entry += 1;
             let count = *count_entry;
             // Apply an exponential backoff to how often to prove an instruction;
-            let prove =
-                count < 5 || (count < 25 && count % 5 == 0) || (count < 125 && count % 25 == 0);
+            let prove = count < 5
+                || (count < 25 && count.is_multiple_of(5))
+                || (count < 125 && count.is_multiple_of(25));
             if !prove {
                 mach.step_n(1)?;
                 continue;
@@ -316,9 +332,9 @@ fn main() -> Result<()> {
             let after = mach.hash();
             println!(" - done");
             proofs.push(ProofInfo {
-                before: before.to_string(),
+                before: hex::encode(before),
                 proof: hex::encode(proof),
-                after: after.to_string(),
+                after: hex::encode(after),
             });
             mach.step_n(opts.proving_interval.saturating_sub(1))?;
         }
@@ -338,9 +354,9 @@ fn main() -> Result<()> {
     if !proofs.is_empty() && mach.is_halted() {
         let hash = mach.hash();
         proofs.push(ProofInfo {
-            before: hash.to_string(),
+            before: hex::encode(hash),
             proof: hex::encode(mach.serialize_proof()),
-            after: hash.to_string(),
+            after: hex::encode(hash),
         });
     }
 
@@ -464,7 +480,38 @@ fn main() -> Result<()> {
         eprintln!("Machine didn't finish: {}", mach.get_status().red());
         std::process::exit(1);
     }
+
+    if let Some(expected) = expected_state {
+        if mach.get_status() != MachineStatus::Finished {
+            eprintln!("Machine did not finish: {}", mach.get_status().red());
+            std::process::exit(1);
+        }
+        let actual = mach.get_global_state().into();
+        if expected != actual {
+            eprintln!("Expected state does not match actual state: {expected:?} != {actual:?}");
+            std::process::exit(1);
+        } else {
+            println!("Computed state matches the expected one");
+        }
+    }
+
     Ok(())
+}
+
+fn get_expected_state(opts: &Opts) -> Result<Option<GoGlobalState>> {
+    let Some(ref path) = opts.json_inputs else {
+        return Ok(None);
+    };
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct ExpectedState {
+        #[serde(default)]
+        expected_end_state: Option<GoGlobalState>,
+    }
+
+    let file = File::open(path)?;
+    Ok(serde_json::from_reader::<_, ExpectedState>(BufReader::new(file))?.expected_end_state)
 }
 
 fn initialize_machine(opts: &Opts) -> eyre::Result<Machine> {
@@ -531,10 +578,17 @@ fn initialize_machine(opts: &Opts) -> eyre::Result<Machine> {
 
         let last_block_hash = decode_hex_arg(&opts.last_block_hash, "--last-block-hash")?;
         let last_send_root = decode_hex_arg(&opts.last_send_root, "--last-send-root")?;
+        let mel_state_root = decode_hex_arg(&opts.mel_state_root, "--mel-state-root")?;
+        let mel_msg_hash = decode_hex_arg(&opts.mel_msg_hash, "--mel-msg-hash")?;
 
         let global_state = GlobalState {
             u64_vals: [opts.inbox_position, opts.position_within_message],
-            bytes32_vals: [last_block_hash, last_send_root],
+            bytes32_vals: [
+                last_block_hash,
+                last_send_root,
+                mel_state_root,
+                mel_msg_hash,
+            ],
         };
 
         Machine::from_paths(

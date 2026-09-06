@@ -4,14 +4,15 @@ use crate::{
     config::WasmerEnv,
 };
 use anyhow::Context;
+use bytes::Bytes;
 use colored::Colorize;
-use is_terminal::IsTerminal;
+use sha2::Digest;
+use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
-use wasmer_api::WasmerClient;
+use wasmer_backend_api::WasmerClient;
 use wasmer_config::package::{Manifest, PackageHash};
-use webc::wasmer_package::Package;
 
-/// Push a package to the registry.
+/// Push a package to the registry from a `wasmer.toml` project or a raw `.webc` file.
 ///
 /// The result of this operation is that the hash of the package can be used to reference the
 /// pushed package.
@@ -48,7 +49,10 @@ pub struct PackagePush {
     #[clap(long, default_value_t = !std::io::stdin().is_terminal())]
     pub non_interactive: bool,
 
-    /// Directory containing the `wasmer.toml`, or a custom *.toml manifest file.
+    /// Path to a package source:
+    /// - a directory containing `wasmer.toml`
+    /// - a custom `*.toml` manifest file
+    /// - a pre-built raw `*.webc` file
     ///
     /// Defaults to current working directory.
     #[clap(name = "path", default_value = ".")]
@@ -65,12 +69,11 @@ impl PackagePush {
             return Ok(owner.clone());
         }
 
-        if let Some(pkg) = &manifest.package {
-            if let Some(ns) = &pkg.name {
-                if let Some(first) = ns.split('/').next() {
-                    return Ok(first.to_string());
-                }
-            }
+        if let Some(pkg) = &manifest.package
+            && let Some(ns) = &pkg.name
+            && let Some(first) = ns.split('/').next()
+        {
+            return Ok(first.to_string());
         }
 
         if self.non_interactive {
@@ -78,7 +81,7 @@ impl PackagePush {
             anyhow::bail!("No package namespace specified: use --namespace XXX");
         }
 
-        let user = wasmer_api::query::current_user_with_namespaces(client, None).await?;
+        let user = wasmer_backend_api::query::current_user_with_namespaces(client, None).await?;
         let owner = crate::utils::prompts::prompt_for_namespace(
             "Choose a namespace to push the package to",
             None,
@@ -93,12 +96,11 @@ impl PackagePush {
             return Ok(Some(name.clone()));
         }
 
-        if let Some(pkg) = &manifest.package {
-            if let Some(ns) = &pkg.name {
-                if let Some(name) = ns.split('/').nth(1) {
-                    return Ok(Some(name.to_string()));
-                }
-            }
+        if let Some(pkg) = &manifest.package
+            && let Some(ns) = &pkg.name
+            && let Some(name) = ns.split('/').nth(1)
+        {
+            return Ok(Some(name.to_string()));
         }
 
         Ok(None)
@@ -112,7 +114,7 @@ impl PackagePush {
     }
 
     async fn should_push(&self, client: &WasmerClient, hash: &PackageHash) -> anyhow::Result<bool> {
-        let res = wasmer_api::query::get_package_release(client, &hash.to_string()).await;
+        let res = wasmer_backend_api::query::get_package_release(client, &hash.to_string()).await;
         tracing::info!("{:?}", res);
         res.map(|p| p.is_none())
     }
@@ -122,17 +124,25 @@ impl PackagePush {
         client: &WasmerClient,
         namespace: &str,
         name: Option<String>,
-        package: &Package,
+        package_bytes: Bytes,
         package_hash: &PackageHash,
         private: bool,
     ) -> anyhow::Result<()> {
         let pb = make_spinner!(self.quiet, "Uploading the package..");
 
-        let signed_url = upload(client, package_hash, self.timeout, package, pb.clone()).await?;
+        let signed_url = upload(
+            client,
+            package_hash,
+            self.timeout,
+            package_bytes,
+            pb.clone(),
+            self.env.proxy()?,
+        )
+        .await?;
         spinner_ok!(pb, "Package correctly uploaded");
 
         let pb = make_spinner!(self.quiet, "Waiting for package to become available...");
-        match wasmer_api::query::push_package_release(
+        match wasmer_backend_api::query::push_package_release(
             client,
             name.as_deref(),
             namespace,
@@ -145,7 +155,9 @@ impl PackagePush {
                 if r.success {
                     r.package_webc.unwrap().id
                 } else {
-                    anyhow::bail!("An unidentified error occurred while publishing the package. (response had success: false)")
+                    anyhow::bail!(
+                        "An unidentified error occurred while publishing the package. (response had success: false)"
+                    )
                 }
             }
             None => anyhow::bail!("An unidentified error occurred while publishing the package."), // <- This is extremely bad..
@@ -163,20 +175,57 @@ impl PackagePush {
         manifest: &Manifest,
         manifest_path: &Path,
     ) -> anyhow::Result<(String, PackageHash)> {
-        tracing::info!("Building package");
-        let pb = make_spinner!(self.quiet, "Creating the package locally...");
-        let (package, hash) = PackageBuild::check(manifest_path.to_path_buf())
-            .execute()
-            .context("While trying to build the package locally")?;
+        // Check if manifest_path is a .webc file
+        let is_webc = manifest_path.is_file()
+            && manifest_path.extension().and_then(|s| s.to_str()) == Some("webc");
 
-        spinner_ok!(pb, "Correctly built package locally");
+        let (hash, package_bytes) = if is_webc {
+            tracing::info!("Loading pre-built package from webc");
+            let pb = make_spinner!(self.quiet, "Loading the package...");
+
+            // Load the package from the webc file
+            let package_data = std::fs::read(manifest_path).with_context(|| {
+                format!("Failed to read webc file '{}'", manifest_path.display())
+            })?;
+
+            // Calculate hash
+            let hash_bytes: [u8; 32] = sha2::Sha256::digest(&package_data).into();
+            let hash = PackageHash::from_sha256_bytes(hash_bytes);
+
+            // Validate the webc file by parsing it (from_bytes consumes the data)
+            // TODO: avoid reading the whole file into memory.
+            let package_bytes = bytes::Bytes::from(package_data);
+            wasmer_package::utils::from_bytes(package_bytes.clone()).with_context(|| {
+                format!("Failed to parse webc file '{}'", manifest_path.display())
+            })?;
+
+            spinner_ok!(pb, "Correctly loaded pre-built package");
+
+            (hash, package_bytes)
+        } else {
+            tracing::info!("Building package");
+            let pb = make_spinner!(self.quiet, "Creating the package locally...");
+            let (package, hash) = PackageBuild::check(manifest_path.to_path_buf())
+                .execute()
+                .context("While trying to build the package locally")?;
+
+            spinner_ok!(pb, "Correctly built package locally");
+
+            // TODO: avoid keeping the whole package in memory for large packages.
+            let package_bytes = package.serialize()?;
+
+            (hash, package_bytes)
+        };
+
         tracing::info!("Package has hash: {hash}");
 
         let namespace = self.get_namespace(client, manifest).await?;
         let name = self.get_name(manifest).await?;
 
         let private = self.get_privacy(manifest);
-        tracing::info!("If published, package privacy is {private}, namespace is {namespace} and name is {name:?}");
+        tracing::info!(
+            "If published, package privacy is {private}, namespace is {namespace} and name is {name:?}"
+        );
 
         let pb = make_spinner!(
             self.quiet,
@@ -188,7 +237,7 @@ impl PackagePush {
                 pb.finish_and_clear();
                 // spinner_ok!(pb, "Package not in the registry yet!");
 
-                self.do_push(client, &namespace, name, &package, &hash, private)
+                self.do_push(client, &namespace, name, package_bytes, &hash, private)
                     .await
                     .map_err(on_error)?;
             } else {
@@ -249,10 +298,16 @@ impl AsyncCliCommand for PackagePush {
                     .bold()
                 )
             } else {
-                eprintln!("{} Succesfully pushed package ({hash})", "✔".green().bold());
+                eprintln!(
+                    "{} Successfully pushed package ({hash})",
+                    "✔".green().bold()
+                );
             }
         } else {
-            eprintln!("{} Succesfully pushed package ({hash})", "✔".green().bold());
+            eprintln!(
+                "{} Successfully pushed package ({hash})",
+                "✔".green().bold()
+            );
         }
 
         Ok(())

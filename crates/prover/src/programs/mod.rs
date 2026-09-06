@@ -1,31 +1,30 @@
 // Copyright 2022-2026, Offchain Labs, Inc.
 // For license information, see https://github.com/OffchainLabs/nitro/blob/master/LICENSE.md
 
-use crate::{
-    binary::{ExportKind, WasmBinary},
-    machine::Module,
-    memory::MemoryType,
-    programs::config::CompileConfig,
-    value::{FunctionType as ArbFunctionType, Value},
-};
-use arbutil::{evm::ARBOS_VERSION_STYLUS_CHARGING_FIXES, math::SaturatingSum, Bytes32, Color};
-use eyre::{bail, eyre, Report, Result, WrapErr};
-use fnv::FnvHashMap as HashMap;
 use std::fmt::Debug;
+
+use arbutil::{Bytes32, Color, evm::ARBOS_VERSION_STYLUS_CHARGING_FIXES, math::SaturatingSum};
+use eyre::{Report, Result, WrapErr, bail, eyre};
+use fnv::FnvHashMap as HashMap;
 use wasmer_types::{
-    entity::EntityRef, FunctionIndex, GlobalIndex, GlobalInit, ImportIndex, LocalFunctionIndex,
-    SignatureIndex, Type,
+    FunctionIndex, GlobalIndex, GlobalInit, ImportIndex, LocalFunctionIndex, Pages, SignatureIndex,
+    Type, entity::EntityRef,
 };
 use wasmparser::{Operator, ValType};
-
 #[cfg(feature = "native")]
 use {
     super::value,
     std::marker::PhantomData,
-    wasmer::{
-        ExportIndex, FunctionMiddleware, GlobalType, MiddlewareError, ModuleMiddleware, Mutability,
-    },
-    wasmer_types::{MemoryIndex, ModuleInfo},
+    wasmer::sys::{FunctionMiddleware, MiddlewareError, ModuleMiddleware},
+    wasmer_types::{ExportIndex, GlobalType, MemoryIndex, ModuleInfo, Mutability},
+};
+
+use crate::{
+    binary::{ExportKind, WasmBinary},
+    machine::Module,
+    memory_type::MemoryType,
+    programs::config::CompileConfig,
+    value::{FunctionType as ArbFunctionType, Value},
 };
 
 pub mod config;
@@ -39,7 +38,6 @@ pub mod prelude;
 pub mod start;
 
 pub const STYLUS_ENTRY_POINT: &str = "user_entrypoint";
-/// Minimum Stylus version that rejects WebAssembly multi-value constructs.
 pub const STYLUS_VERSION_DISABLE_MULTIVALUE: u16 = 3;
 
 pub trait ModuleMod {
@@ -55,6 +53,7 @@ pub trait ModuleMod {
     /// Drops debug-only info like export names.
     fn drop_exports_and_names(&mut self, keep: &HashMap<&str, ExportKind>);
     fn memory_info(&self) -> Result<MemoryType>;
+    fn set_memory_max(&mut self, max: Pages) -> Result<()>;
 }
 
 pub trait Middleware<M: ModuleMod> {
@@ -129,7 +128,7 @@ where
     fn generate_function_middleware<'a>(
         &self,
         local_function_index: LocalFunctionIndex,
-    ) -> Box<dyn wasmer::FunctionMiddleware<'a> + 'a> {
+    ) -> Box<dyn FunctionMiddleware<'a> + 'a> {
         let worker = self.0.instrument(local_function_index).unwrap();
         Box::new(FuncMiddlewareWrapper(worker, PhantomData))
     }
@@ -156,7 +155,7 @@ where
     fn feed(
         &mut self,
         op: Operator<'a>,
-        out: &mut wasmer::MiddlewareReaderState<'a>,
+        out: &mut wasmer::sys::MiddlewareReaderState<'a>,
     ) -> Result<(), MiddlewareError> {
         let name = self.0.name().red();
         let error = |err| MiddlewareError::new(name, format!("{err:?}"));
@@ -262,6 +261,19 @@ impl ModuleMod for ModuleInfo {
             bail!("missing memory with export name {}", "memory".red());
         }
         Ok(self.memories.last().unwrap().into())
+    }
+
+    fn set_memory_max(&mut self, max: Pages) -> Result<()> {
+        let idx = MemoryIndex::from_u32(0);
+        let mem = self
+            .memories
+            .get_mut(idx)
+            .ok_or_else(|| eyre!("missing memory"))?;
+        mem.maximum = Some(match mem.maximum {
+            Some(existing) => existing.min(max),
+            None => max,
+        });
+        Ok(())
     }
 }
 
@@ -382,6 +394,19 @@ impl ModuleMod for WasmBinary<'_> {
         }
         self.memories.last().unwrap().try_into()
     }
+
+    fn set_memory_max(&mut self, max: Pages) -> Result<()> {
+        let max = max.0 as u64;
+        let mem = self
+            .memories
+            .first_mut()
+            .ok_or_else(|| eyre!("missing memory"))?;
+        mem.maximum = Some(match mem.maximum {
+            Some(existing) => existing.min(max),
+            None => max,
+        });
+        Ok(())
+    }
 }
 
 /// Information about an activated program.
@@ -421,7 +446,11 @@ impl Module {
         wasm: &[u8],
         codehash: &Bytes32,
         stylus_version: u16,
-        arbos_version_for_gas: u64, // must only be used for activation gas
+        // The current ArbOS version when activating a new contract, or zero when recompiling an
+        // already-active contract (in which case the original activation version is unknown).
+        // May be used to determine activation gas cost or to decide whether activation succeeds,
+        // but must NOT affect the compilation result (otherwise recompilation would differ).
+        arbos_version_for_activation: u64,
         page_limit: u16,
         debug: bool,
         gas: &mut u64,
@@ -430,14 +459,14 @@ impl Module {
         let (bin, stylus_data) = WasmBinary::parse_user(
             wasm,
             stylus_version,
-            arbos_version_for_gas,
+            arbos_version_for_activation,
             page_limit,
             &compile,
             codehash,
         )
         .wrap_err("failed to parse wasm")?;
 
-        if arbos_version_for_gas > 0 {
+        if arbos_version_for_activation > 0 {
             // converts a number of microseconds to gas
             // TODO: collapse to a single value after finalizing factors
             let us_to_gas = |us: u64| {
@@ -448,7 +477,7 @@ impl Module {
             };
 
             macro_rules! pay {
-                ($us:expr) => {
+                ($us:expr_2021) => {
                     let amount = us_to_gas($us);
                     if *gas < amount {
                         *gas = 0;
@@ -459,7 +488,7 @@ impl Module {
             }
 
             // pay for wasm
-            if arbos_version_for_gas >= ARBOS_VERSION_STYLUS_CHARGING_FIXES {
+            if arbos_version_for_activation >= ARBOS_VERSION_STYLUS_CHARGING_FIXES {
                 let wasm_len = wasm.len() as u64;
                 pay!(wasm_len.saturating_mul(31_733) / 100_000);
             }
@@ -498,45 +527,125 @@ impl Module {
 }
 
 #[cfg(test)]
-mod version_tests {
-    use super::*;
-    use crate::binary;
+mod test {
     use std::path::Path;
 
-    #[test]
-    fn stylus_v3_rejects_multi_value_wasm() {
-        let wasm = wat::parse_str(
-            r#"(module
-                (func (result i32 i32) i32.const 1 i32.const 2)
-            )"#,
-        )
-        .unwrap();
+    use super::*;
+    use crate::binary;
 
-        assert!(binary::parse_with_stylus_version(&wasm, Path::new("test"), 2).is_ok());
-        assert!(binary::parse_with_stylus_version(&wasm, Path::new("test"), 3).is_err());
+    // Parse at the threshold version so multi-value is rejected by the validator.
+    fn parse_at_threshold(wat: &str) -> Result<WasmBinary<'static>> {
+        let wasm: &'static [u8] = Box::leak(wat::parse_str(wat).unwrap().into_boxed_slice());
+        binary::parse_with_stylus_version(
+            wasm,
+            Path::new("test"),
+            STYLUS_VERSION_DISABLE_MULTIVALUE,
+        )
     }
 
     #[test]
-    fn stylus_v3_selects_fixed_memory_fill() {
-        let wasm = wat::parse_str(
+    fn test_no_multi_value() {
+        // Single-value wasm is accepted at and above the threshold.
+        assert!(
+            parse_at_threshold(
+                r#"(module
+                (func (param i32) (result i32)
+                    local.get 0
+                )
+            )"#,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_reject_multi_value_function() {
+        // Function type with two return values.
+        assert!(
+            parse_at_threshold(
+                r#"(module
+                (func (result i32 i32)
+                    i32.const 1
+                    i32.const 2
+                )
+            )"#,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_reject_multi_value_block() {
+        // (block (param i32) (result i32)) — BlockType::FuncType, rejected even with 1 result.
+        // Single-value equivalent: (block (result i32) local.get 0)
+        assert!(
+            parse_at_threshold(
+                r#"(module
+                (func (param i32) (result i32)
+                    local.get 0
+                    (block (param i32) (result i32))
+                )
+            )"#,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_reject_multi_value_loop() {
+        // (loop (param i32) (result i32)) — BlockType::FuncType, rejected even with 1 result.
+        // Single-value equivalent: (loop  local.get 0  ...)  with value produced inside.
+        assert!(
+            parse_at_threshold(
+                r#"(module
+                (func (param i32) (result i32)
+                    local.get 0
+                    (loop (param i32) (result i32))
+                )
+            )"#,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_reject_multi_value_if() {
+        // (if (param i32) (result i32)) — BlockType::FuncType, rejected even with 1 result.
+        // Single-value equivalent: (if (result i32) (then local.get 0) (else i32.const 0))
+        assert!(
+            parse_at_threshold(
+                r#"(module
+                (func (param i32 i32) (result i32)
+                    local.get 0
+                    local.get 1
+                    (if (param i32) (result i32)
+                        (then)
+                        (else)
+                    )
+                )
+            )"#,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_multi_value_gate() {
+        // Multi-value wasm is allowed for Stylus V1/V2 and rejected from V3 onward.
+        // During recompilation Go passes the stored per-contract version, so a V2 contract
+        // recompiled after the V3 upgrade still arrives here as stylus_version=2.
+        let wasm = wasmer::wat2wasm(
             r#"(module
-                (memory (export "memory") 1 1)
-                (func (export "user_entrypoint") (param i32) (result i32)
-                    i32.const 0
-                    i32.const 0x1234
-                    i32.const 8
-                    memory.fill
-                    i32.const 0))"#,
+            (memory (export "memory") 1 1)
+            (func (result i32 i32) i32.const 1 i32.const 2)
+            (func (export "user_entrypoint") (param i32) (result i32) i32.const 0)
+        )"#
+            .as_bytes(),
         )
         .unwrap();
-        let activate = |version| {
-            let mut gas = u64::MAX;
-            Module::activate(&wasm, &Bytes32::default(), version, 0, 128, false, &mut gas)
-                .unwrap()
-                .0
-                .hash()
-        };
-
-        assert_ne!(activate(2), activate(3));
+        for (version, allowed) in [(1, true), (2, true), (3, false), (4, false)] {
+            let result = binary::parse_with_stylus_version(&wasm, Path::new("test"), version);
+            assert_eq!(result.is_ok(), allowed, "stylus_version={version}");
+        }
     }
 }

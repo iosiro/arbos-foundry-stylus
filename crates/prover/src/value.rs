@@ -1,19 +1,20 @@
 // Copyright 2021-2026, Offchain Labs, Inc.
 // For license information, see https://github.com/OffchainLabs/nitro/blob/master/LICENSE.md
 
-use crate::binary::FloatType;
-use arbutil::{Bytes32, Color};
-use digest::Digest;
-use eyre::{bail, ErrReport, Result};
-use serde::{Deserialize, Serialize};
-use serde_with::{serde_as, TryFromInto};
-use sha3::Keccak256;
 use std::{
     convert::{TryFrom, TryInto},
     fmt::Display,
     ops::Add,
 };
+
+use arbutil::{Bytes32, Color, crypto};
+use eyre::{ErrReport, Result, bail};
+use serde::{Deserialize, Serialize};
+use serde_with::{TryFromInto, serde_as};
+use tiny_keccak::{Hasher, Keccak};
 use wasmparser::{FuncType, RefType, ValType};
+
+use crate::binary::FloatType;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Serialize, Deserialize)]
 #[repr(u8)]
@@ -72,7 +73,8 @@ impl From<ArbValueType> for ValType {
             V::F64 => Self::F64,
             V::RefNull => Self::Ref(RefType::NULLREF),
             V::FuncRef => Self::Ref(RefType::FUNCREF),
-            V::InternalRef => Self::Ref(RefType::FUNCREF), // not analogous, but essentially a func pointer
+            V::InternalRef => Self::Ref(RefType::FUNCREF), /* not analogous, but essentially a
+                                                            * func pointer */
         }
     }
 }
@@ -87,6 +89,7 @@ pub fn parser_type(ty: &wasmer::Type) -> wasmer::wasmparser::ValType {
         wasmer::Type::V128 => wasmer::wasmparser::ValType::V128,
         wasmer::Type::ExternRef => wasmer::wasmparser::ValType::Ref(RefType::EXTERNREF),
         wasmer::Type::FuncRef => wasmer::wasmparser::ValType::Ref(RefType::FUNCREF),
+        wasmer::Type::ExceptionRef => wasmer::wasmparser::ValType::Ref(RefType::EXNREF),
     }
 }
 
@@ -259,11 +262,11 @@ impl Value {
     }
 
     pub fn hash(self) -> Bytes32 {
-        let mut h = Keccak256::new();
-        h.update(b"Value:");
-        h.update([self.ty() as u8]);
-        h.update(self.contents_for_proof());
-        h.finalize().into()
+        crypto::keccak_seq(&[
+            b"Value:",
+            &[self.ty() as u8],
+            self.contents_for_proof().as_ref(),
+        ])
     }
 
     pub fn default_of_type(ty: ArbValueType) -> Value {
@@ -285,12 +288,10 @@ impl Display for Value {
         let rparem = ")".grey();
 
         macro_rules! single {
-            ($ty:expr, $value:expr) => {{
-                write!(f, "{}{}{}{}", $ty.grey(), lparem, $value, rparem)
-            }};
+            ($ty:expr_2021, $value:expr_2021) => {{ write!(f, "{}{}{}{}", $ty.grey(), lparem, $value, rparem) }};
         }
         macro_rules! pair {
-            ($ty:expr, $left:expr, $right:expr) => {{
+            ($ty:expr_2021, $left:expr_2021, $right:expr_2021) => {{
                 let eq = "=".grey();
                 write!(
                     f,
@@ -419,17 +420,19 @@ impl FunctionType {
     }
 
     pub fn hash(&self) -> Bytes32 {
-        let mut h = Keccak256::new();
+        let mut h = Keccak::v256();
         h.update(b"Function type:");
-        h.update(Bytes32::from(self.inputs.len()));
+        h.update(Bytes32::from(self.inputs.len()).as_ref());
         for input in &self.inputs {
-            h.update([*input as u8]);
+            h.update(&[*input as u8]);
         }
-        h.update(Bytes32::from(self.outputs.len()));
+        h.update(Bytes32::from(self.outputs.len()).as_ref());
         for output in &self.outputs {
-            h.update([*output as u8]);
+            h.update(&[*output as u8]);
         }
-        h.finalize().into()
+        let mut out = [0u8; 32];
+        h.finalize(&mut out);
+        out.into()
     }
 }
 

@@ -1,22 +1,21 @@
 // Copyright 2021-2026, Offchain Labs, Inc.
 // For license information, see https://github.com/OffchainLabs/nitro/blob/master/LICENSE.md
 
-use arbutil::Bytes32;
-use bitvec::prelude::*;
 use core::panic;
-use digest::Digest;
+use std::{
+    cmp::max,
+    convert::{TryFrom, TryInto},
+};
+
+use arbutil::{Bytes32, crypto};
+use bitvec::prelude::*;
 use enum_iterator::Sequence;
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
-use sha3::Keccak256;
-use std::cmp::max;
-use std::convert::{TryFrom, TryInto};
-
 #[cfg(feature = "rayon")]
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 
 mod zerohashes;
-use self::zerohashes::{EMPTY_HASH, ZERO_HASHES};
 #[cfg(feature = "counters")]
 use {
     enum_iterator::all,
@@ -24,6 +23,8 @@ use {
     std::collections::HashMap,
     std::sync::atomic::{AtomicUsize, Ordering},
 };
+
+use self::zerohashes::{EMPTY_HASH, ZERO_HASHES};
 
 #[cfg(feature = "counters")]
 fn create_counters_hashmap() -> HashMap<MerkleType, AtomicUsize> {
@@ -42,8 +43,9 @@ lazy_static! {
     static ref RESIZE_COUNTERS: HashMap<MerkleType, AtomicUsize> = create_counters_hashmap();
 }
 
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize, Sequence)]
+#[derive(Default, Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize, Sequence)]
 pub enum MerkleType {
+    #[default]
     Empty,
     Value,
     Function,
@@ -52,12 +54,6 @@ pub enum MerkleType {
     Table,
     TableElement,
     Module,
-}
-
-impl Default for MerkleType {
-    fn default() -> Self {
-        Self::Empty
-    }
 }
 
 #[cfg(feature = "counters")]
@@ -135,11 +131,7 @@ pub struct Merkle {
 }
 
 fn hash_node(ty: MerkleType, a: impl AsRef<[u8]>, b: impl AsRef<[u8]>) -> Bytes32 {
-    let mut h = Keccak256::new();
-    h.update(ty.get_prefix());
-    h.update(a);
-    h.update(b);
-    h.finalize().into()
+    crypto::keccak_seq(&[ty.get_prefix().as_bytes(), a.as_ref(), b.as_ref()])
 }
 
 const fn empty_hash_at(ty: MerkleType, layer_i: usize) -> &'static Bytes32 {
@@ -169,11 +161,10 @@ fn new_layer(ty: MerkleType, layer: &[Bytes32], empty_hash: &'static Bytes32) ->
 #[inline]
 #[cfg(not(feature = "rayon"))]
 fn new_layer(ty: MerkleType, layer: &[Bytes32], empty_hash: &'static Bytes32) -> Vec<Bytes32> {
-    let new_layer = layer
+    layer
         .chunks(2)
         .map(|chunk| hash_node(ty, chunk[0], chunk.get(1).unwrap_or(empty_hash)))
-        .collect();
-    new_layer
+        .collect()
 }
 
 impl Clone for Merkle {
@@ -425,11 +416,13 @@ pub mod mutex_sedre {
 
 #[cfg(test)]
 mod test {
+    use core::panic;
+
+    use arbutil::Bytes32;
+    use enum_iterator::all;
+
     use super::*;
     use crate::memory;
-    use arbutil::Bytes32;
-    use core::panic;
-    use enum_iterator::all;
 
     #[test]
     fn resize_works() {

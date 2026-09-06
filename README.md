@@ -16,19 +16,22 @@ All crates are required dependencies of `stylus`:
 | `arbutil` | Core utilities and types |
 | `brotli` | Brotli compression |
 | `caller-env` | Caller environment for host functions |
+| `validation` | Shared validation types |
 | `prover` | WASM parsing, config, machine execution |
+| `prover-ffi` | Native prover interface |
 | `stylus` | Main Stylus VM implementation |
+| `user-host-trait` | Stylus host interface |
 
 ## Building
 
 ```bash
-cargo build --release
+cargo build --release --features cc_brotli
 ```
 
 ## Testing
 
 ```bash
-cargo test
+cargo test --features cc_brotli
 ```
 
 ## Fork Maintenance
@@ -37,7 +40,7 @@ cargo test
 
 - **Repository**: https://github.com/OffchainLabs/nitro
 - **Source Path**: `crates/`
-- **Current Base**: v3.9.5
+- **Current Base**: v3.11.0 (`a618155919315241665356fe60f3cd00d66d5e46`)
 
 ### Merging Upstream Changes
 
@@ -52,16 +55,14 @@ git fetch upstream --tags
 
 ```bash
 # See what changed between tags
-git diff v3.9.5..v3.9.6 -- crates/
+git diff v3.11.0..vX.Y.Z -- crates/
 ```
 
 #### 3. Apply Changes
 
 ```bash
-# Create a branch for the merge
-git checkout -b merge-upstream-v3.9.6
-
-# Cherry-pick or manually apply relevant changes
+# Import the complete included crate trees from the selected Nitro tag,
+# then reapply only the standalone workspace and native-build adaptations.
 ```
 
 #### 4. Update Documentation
@@ -73,7 +74,7 @@ After merging:
 #### 5. Commit
 
 ```bash
-git commit -m "Merge upstream tag 'vX.Y.Z'"
+git commit -m "chore: vendor Stylus runtime from Nitro vX.Y.Z"
 ```
 
 ### Crates NOT to Merge
@@ -87,8 +88,8 @@ git commit -m "Merge upstream tag 'vX.Y.Z'"
 ### Verification After Merge
 
 ```bash
-cargo build --release
-cargo test
+cargo build --release --features cc_brotli
+cargo test --features cc_brotli
 ```
 
 ## Directory Structure

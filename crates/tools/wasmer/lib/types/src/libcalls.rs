@@ -1,4 +1,4 @@
-use enum_iterator::IntoEnumIterator;
+use enum_iterator::Sequence;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 #[cfg(feature = "enable-serde")]
 use serde::{Deserialize, Serialize};
@@ -8,20 +8,11 @@ use std::fmt;
 ///
 /// This list is likely to grow over time.
 #[derive(
-    Copy,
-    Clone,
-    Debug,
-    PartialEq,
-    Eq,
-    Hash,
-    IntoEnumIterator,
-    RkyvSerialize,
-    RkyvDeserialize,
-    Archive,
-    rkyv::CheckBytes,
+    Copy, Clone, Debug, PartialEq, Eq, Hash, Sequence, RkyvSerialize, RkyvDeserialize, Archive,
 )]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
-#[archive(as = "Self")]
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
+#[rkyv(derive(Debug, Hash, PartialEq, Eq), compare(PartialEq))]
 #[repr(u16)]
 pub enum LibCall {
     /// ceil.f32
@@ -133,8 +124,124 @@ pub enum LibCall {
     /// memory.atomic.notify for local memories
     Memory32AtomicNotify,
 
-    /// memory.atomic.botify for imported memories
+    /// memory.atomic.notify for imported memories
     ImportedMemory32AtomicNotify,
+
+    /// throw
+    Throw,
+
+    /// allocate exception object and get an exnref for it
+    AllocException,
+    /// Get the values buffer pointer out of an exnref
+    ReadExnRef,
+    /// Given a caught native exception pointer, get the exnref and delete the exception itself
+    LibunwindExceptionIntoExnRef,
+
+    /// The personality function
+    EHPersonality,
+    /// The second stage of the EH personality function
+    EHPersonality2,
+
+    /// debug_usize
+    DebugUsize,
+    /// debug_str
+    DebugStr,
+
+    // Soft-float routines emitted by LLVM when targeting platforms without hardware floating-point.
+    // Standard toolchains (compiler-rt / libgcc) provide these, but wasmer needs to know their
+    // addresses to link JIT-compiled objects.
+    // Ordered to match the GCC runtime library documentation (§3.2).
+    // https://gcc.gnu.org/onlinedocs/gccint/Soft-float-library-routines.html
+
+    // §3.2.1 Arithmetic
+    /// __addsf3
+    Addsf3,
+    /// __adddf3
+    Adddf3,
+    /// __subsf3
+    Subsf3,
+    /// __subdf3
+    Subdf3,
+    /// __mulsf3
+    Mulsf3,
+    /// __muldf3
+    Muldf3,
+    /// __divsf3
+    Divsf3,
+    /// __divdf3
+    Divdf3,
+    /// __negsf2
+    Negsf2,
+    /// __negdf2
+    Negdf2,
+
+    // §3.2.2 Conversion
+    /// __extendsfdf2
+    Extendsfdf2,
+    /// __truncdfsf2
+    Truncdfsf2,
+    /// __fixsfsi
+    Fixsfsi,
+    /// __fixdfsi
+    Fixdfsi,
+    /// __fixsfdi
+    Fixsfdi,
+    /// __fixdfdi
+    Fixdfdi,
+    /// __fixunssfsi
+    Fixunssfsi,
+    /// __fixunsdfsi
+    Fixunsdfsi,
+    /// __fixunssfdi
+    Fixunssfdi,
+    /// __fixunsdfdi
+    Fixunsdfdi,
+    /// __floatsisf
+    Floatsisf,
+    /// __floatsidf
+    Floatsidf,
+    /// __floatdisf
+    Floatdisf,
+    /// __floatdidf
+    Floatdidf,
+    /// __floatunsisf
+    Floatunsisf,
+    /// __floatunsidf
+    Floatunsidf,
+    /// __floatundisf
+    Floatundisf,
+    /// __floatundidf
+    Floatundidf,
+
+    // §3.2.3 Comparison
+    /// __unordsf2
+    Unordsf2,
+    /// __unorddf2
+    Unorddf2,
+    /// __eqsf2
+    Eqsf2,
+    /// __eqdf2
+    Eqdf2,
+    /// __nesf2
+    Nesf2,
+    /// __nedf2
+    Nedf2,
+    /// __gesf2
+    Gesf2,
+    /// __gedf2
+    Gedf2,
+    /// __ltsf2
+    Ltsf2,
+    /// __ltdf2
+    Ltdf2,
+    /// __lesf2
+    Lesf2,
+    /// __ledf2
+    Ledf2,
+    /// __gtsf2
+    Gtsf2,
+    /// __gtdf2
+    Gtdf2,
 }
 
 impl LibCall {
@@ -183,6 +290,57 @@ impl LibCall {
             Self::ImportedMemory32AtomicWait64 => "wasmer_vm_imported_memory32_atomic_wait64",
             Self::Memory32AtomicNotify => "wasmer_vm_memory32_atomic_notify",
             Self::ImportedMemory32AtomicNotify => "wasmer_vm_imported_memory32_atomic_notify",
+            Self::Throw => "wasmer_vm_throw",
+            Self::EHPersonality => "wasmer_eh_personality",
+            Self::EHPersonality2 => "wasmer_eh_personality2",
+            Self::AllocException => "wasmer_vm_alloc_exception",
+            Self::ReadExnRef => "wasmer_vm_read_exnref",
+            Self::LibunwindExceptionIntoExnRef => "wasmer_vm_exception_into_exnref",
+            Self::DebugUsize => "wasmer_vm_dbg_usize",
+            Self::DebugStr => "wasmer_vm_dbg_str",
+            // --- Soft-float libcalls ---
+            Self::Addsf3 => "__addsf3",
+            Self::Adddf3 => "__adddf3",
+            Self::Subsf3 => "__subsf3",
+            Self::Subdf3 => "__subdf3",
+            Self::Mulsf3 => "__mulsf3",
+            Self::Muldf3 => "__muldf3",
+            Self::Divsf3 => "__divsf3",
+            Self::Divdf3 => "__divdf3",
+            Self::Negsf2 => "__negsf2",
+            Self::Negdf2 => "__negdf2",
+            Self::Extendsfdf2 => "__extendsfdf2",
+            Self::Truncdfsf2 => "__truncdfsf2",
+            Self::Fixsfsi => "__fixsfsi",
+            Self::Fixdfsi => "__fixdfsi",
+            Self::Fixsfdi => "__fixsfdi",
+            Self::Fixdfdi => "__fixdfdi",
+            Self::Fixunssfsi => "__fixunssfsi",
+            Self::Fixunsdfsi => "__fixunsdfsi",
+            Self::Fixunssfdi => "__fixunssfdi",
+            Self::Fixunsdfdi => "__fixunsdfdi",
+            Self::Floatsisf => "__floatsisf",
+            Self::Floatsidf => "__floatsidf",
+            Self::Floatdisf => "__floatdisf",
+            Self::Floatdidf => "__floatdidf",
+            Self::Floatunsisf => "__floatunsisf",
+            Self::Floatunsidf => "__floatunsidf",
+            Self::Floatundisf => "__floatundisf",
+            Self::Floatundidf => "__floatundidf",
+            Self::Unordsf2 => "__unordsf2",
+            Self::Unorddf2 => "__unorddf2",
+            Self::Eqsf2 => "__eqsf2",
+            Self::Eqdf2 => "__eqdf2",
+            Self::Nesf2 => "__nesf2",
+            Self::Nedf2 => "__nedf2",
+            Self::Gesf2 => "__gesf2",
+            Self::Gedf2 => "__gedf2",
+            Self::Ltsf2 => "__ltsf2",
+            Self::Ltdf2 => "__ltdf2",
+            Self::Lesf2 => "__lesf2",
+            Self::Ledf2 => "__ledf2",
+            Self::Gtsf2 => "__gtsf2",
+            Self::Gtdf2 => "__gtdf2",
         }
     }
 }

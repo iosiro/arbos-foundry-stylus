@@ -1,3 +1,4 @@
+#![allow(clippy::result_large_err)]
 use std::{
     collections::HashMap,
     future::Future,
@@ -8,11 +9,10 @@ use std::{
 };
 
 use anyhow::Context;
-use exec::spawn_exec_wasm;
+use shared_buffer::OwnedBuffer;
 use virtual_fs::{AsyncReadExt, FileSystem};
 use wasmer::FunctionEnvMut;
-use wasmer_wasix_types::wasi::Errno;
-use webc::Container;
+use wasmer_package::utils::from_bytes;
 
 mod binary_package;
 mod exec;
@@ -20,19 +20,24 @@ mod exec;
 pub use self::{
     binary_package::*,
     exec::{
-        run_exec, spawn_exec, spawn_exec_module, spawn_load_module, spawn_load_wasm, spawn_union_fs,
+        package_command_by_name, run_exec, spawn_exec, spawn_exec_module, spawn_exec_wasm,
+        spawn_load_module, spawn_union_fs,
     },
 };
 use crate::{
-    os::{command::Commands, task::TaskJoinHandle},
     Runtime, SpawnError, WasiEnv,
+    os::{
+        command::{Commands, VirtualCommand},
+        task::TaskJoinHandle,
+    },
+    runtime::module_cache::HashedModuleData,
 };
 
 #[derive(Debug, Clone)]
 pub struct BinFactory {
     pub(crate) commands: Commands,
     runtime: Arc<dyn Runtime + Send + Sync + 'static>,
-    pub(crate) local: Arc<RwLock<HashMap<String, Option<BinaryPackage>>>>,
+    pub(crate) local: Arc<RwLock<HashMap<String, Option<Arc<BinaryPackage>>>>>,
 }
 
 impl BinFactory {
@@ -48,9 +53,43 @@ impl BinFactory {
         self.runtime.deref()
     }
 
-    pub fn set_binary(&self, name: &str, binary: BinaryPackage) {
+    /// Register a builtin command.
+    pub fn register_builtin_command<C>(&mut self, cmd: C)
+    where
+        C: VirtualCommand + Send + Sync + 'static,
+    {
+        self.commands.register_command(cmd);
+    }
+
+    /// Register a builtin command at a custom path.
+    pub fn register_builtin_command_with_path<C, P>(&mut self, cmd: C, path: P)
+    where
+        C: VirtualCommand + Send + Sync + 'static,
+        P: Into<String>,
+    {
+        self.commands.register_command_with_path(cmd, path.into());
+    }
+
+    /// Register a builtin command behind an [`Arc`] at a custom path.
+    pub(crate) fn register_builtin_command_with_path_shared<P>(
+        &mut self,
+        cmd: Arc<dyn VirtualCommand + Send + Sync + 'static>,
+        path: P,
+    ) where
+        P: Into<String>,
+    {
+        self.commands
+            .register_command_with_path_shared(cmd, path.into());
+    }
+
+    /// Remove all registered builtin commands.
+    pub fn clear_builtin_commands(&mut self) {
+        self.commands.clear();
+    }
+
+    pub fn set_binary(&self, name: &str, binary: &Arc<BinaryPackage>) {
         let mut cache = self.local.write().unwrap();
-        cache.insert(name.to_string(), Some(binary));
+        cache.insert(name.to_string(), Some(binary.clone()));
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -58,7 +97,7 @@ impl BinFactory {
         &self,
         name: &str,
         fs: Option<&dyn FileSystem>,
-    ) -> Option<BinaryPackage> {
+    ) -> Option<Arc<BinaryPackage>> {
         self.get_executable(name, fs)
             .await
             .and_then(|executable| match executable {
@@ -70,7 +109,6 @@ impl BinFactory {
     pub fn spawn<'a>(
         &'a self,
         name: String,
-        store: wasmer::Store,
         env: WasiEnv,
     ) -> Pin<Box<dyn Future<Output = Result<TaskJoinHandle, SpawnError>> + 'a>> {
         Box::pin(async move {
@@ -81,18 +119,21 @@ impl BinFactory {
                 .ok_or_else(|| SpawnError::BinaryNotFound {
                     binary: name.clone(),
                 });
-            if res.is_err() {
-                env.on_exit(Some(Errno::Noent.into())).await;
-            }
             let executable = res?;
 
             // Execute
             match executable {
                 Executable::Wasm(bytes) => {
-                    spawn_exec_wasm(&bytes, name.as_str(), env, &self.runtime).await
+                    let data = HashedModuleData::new(bytes.clone());
+                    spawn_exec_wasm(data, name.as_str(), env, &self.runtime).await
                 }
                 Executable::BinaryPackage(pkg) => {
-                    spawn_exec(pkg, name.as_str(), store, env, &self.runtime).await
+                    {
+                        let cmd = package_command_by_name(&pkg, name.as_str())?;
+                        env.prepare_spawn(cmd);
+                    }
+
+                    spawn_exec(pkg.as_ref().clone(), name.as_str(), env, &self.runtime).await
                 }
             }
         })
@@ -102,15 +143,12 @@ impl BinFactory {
         &self,
         name: String,
         parent_ctx: Option<&FunctionEnvMut<'_, WasiEnv>>,
-        store: &mut Option<wasmer::Store>,
         builder: &mut Option<WasiEnv>,
     ) -> Result<TaskJoinHandle, SpawnError> {
         // We check for built in commands
         if let Some(parent_ctx) = parent_ctx {
             if self.commands.exists(name.as_str()) {
-                return self
-                    .commands
-                    .exec(parent_ctx, name.as_str(), store, builder);
+                return self.commands.exec(parent_ctx, name.as_str(), builder);
             }
         } else if self.commands.exists(name.as_str()) {
             tracing::warn!("builtin command without a parent ctx - {}", name);
@@ -128,7 +166,7 @@ impl BinFactory {
     ) -> Option<Executable> {
         let name = name.to_string();
 
-        // Fast path
+        // Return early if the path is already cached
         {
             let cache = self.local.read().unwrap();
             if let Some(data) = cache.get(&name) {
@@ -136,32 +174,31 @@ impl BinFactory {
             }
         }
 
-        // Slow path
         let mut cache = self.local.write().unwrap();
 
-        // Check the cache
+        // Check the cache again to avoid a race condition where the cache was populated inbetween the fast path and here
         if let Some(data) = cache.get(&name) {
             return data.clone().map(Executable::BinaryPackage);
         }
 
         // Check the filesystem for the file
-        if name.starts_with('/') {
-            if let Some(fs) = fs {
-                match load_executable_from_filesystem(fs, name.as_ref(), self.runtime()).await {
-                    Ok(executable) => {
-                        if let Executable::BinaryPackage(pkg) = &executable {
-                            cache.insert(name, Some(pkg.clone()));
-                        }
+        if name.starts_with('/')
+            && let Some(fs) = fs
+        {
+            match load_executable_from_filesystem(fs, name.as_ref(), self.runtime()).await {
+                Ok(executable) => {
+                    if let Executable::BinaryPackage(pkg) = &executable {
+                        cache.insert(name, Some(pkg.clone()));
+                    }
 
-                        return Some(executable);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            path = name,
-                            error = &*e,
-                            "Unable to load the package from disk"
-                        );
-                    }
+                    return Some(executable);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = name,
+                        error = &*e,
+                        "Unable to load the package from disk"
+                    );
                 }
             }
         }
@@ -173,8 +210,8 @@ impl BinFactory {
 }
 
 pub enum Executable {
-    Wasm(bytes::Bytes),
-    BinaryPackage(BinaryPackage),
+    Wasm(OwnedBuffer),
+    BinaryPackage(Arc<BinaryPackage>),
 }
 
 async fn load_executable_from_filesystem(
@@ -188,18 +225,35 @@ async fn load_executable_from_filesystem(
         .open(path)
         .context("Unable to open the file")?;
 
-    let mut data = Vec::with_capacity(f.size() as usize);
-    f.read_to_end(&mut data).await.context("Read failed")?;
+    // Fast path if the file is fully available in memory.
+    // Prevents redundant copying of the file data.
+    if let Some(buf) = f.as_owned_buffer() {
+        if wasmer_package::utils::is_container(buf.as_slice()) {
+            let bytes = buf.clone().into_bytes();
+            if let Ok(container) = from_bytes(bytes.clone()) {
+                let pkg = BinaryPackage::from_webc(&container, rt)
+                    .await
+                    .context("Unable to load the package")?;
 
-    let bytes: bytes::Bytes = data.into();
+                return Ok(Executable::BinaryPackage(Arc::new(pkg)));
+            }
+        }
 
-    if let Ok(container) = Container::from_bytes(bytes.clone()) {
-        let pkg = BinaryPackage::from_webc(&container, rt)
-            .await
-            .context("Unable to load the package")?;
-
-        Ok(Executable::BinaryPackage(pkg))
+        Ok(Executable::Wasm(buf))
     } else {
-        Ok(Executable::Wasm(bytes))
+        let mut data = Vec::with_capacity(f.size() as usize);
+        f.read_to_end(&mut data).await.context("Read failed")?;
+
+        let bytes: bytes::Bytes = data.into();
+
+        if let Ok(container) = from_bytes(bytes.clone()) {
+            let pkg = BinaryPackage::from_webc(&container, rt)
+                .await
+                .context("Unable to load the package")?;
+
+            Ok(Executable::BinaryPackage(Arc::new(pkg)))
+        } else {
+            Ok(Executable::Wasm(OwnedBuffer::from_bytes(bytes)))
+        }
     }
 }

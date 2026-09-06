@@ -3,27 +3,35 @@
 
 #![allow(clippy::field_reassign_with_default)]
 
-use crate::{programs::meter, value::FunctionType};
+use std::fmt::Debug;
+
 use arbutil::evm::api::{Gas, Ink};
 use derivative::Derivative;
 use fnv::FnvHashMap as HashMap;
-use std::fmt::Debug;
 use wasmer_types::{Pages, SignatureIndex, WASM_PAGE_SIZE};
 use wasmparser::Operator;
-
-/// Minimum Stylus version that uses the spec-compliant `memory.fill` implementation.
-pub const FIXED_MEMORY_FILL_VERSION: u16 = 3;
-
 #[cfg(feature = "native")]
 use {
     super::{
-        counter::Counter, depth::DepthChecker, dynamic::DynamicMeter, heap::HeapBound,
-        meter::Meter, start::StartMover, MiddlewareWrapper,
+        MiddlewareWrapper, counter::Counter, depth::DepthChecker, dynamic::DynamicMeter,
+        heap::HeapBound, meter::Meter, start::StartMover,
     },
     std::sync::Arc,
-    wasmer::{Cranelift, CraneliftOptLevel, Engine, Store, Target},
+    wasmer::{
+        Engine, Store,
+        sys::{Cranelift, CraneliftOptLevel, Target},
+    },
     wasmer_compiler_singlepass::Singlepass,
 };
+
+use crate::{programs::meter, value::FunctionType};
+
+/// Minimum Stylus version that uses the spec-compliant `memory.fill` implementation.
+/// Prior versions built the 64-bit fill pattern without masking the value to 8 bits.
+pub const FIXED_MEMORY_FILL_VERSION: u16 = 3;
+
+/// Minimum Stylus version that disables multi-value returns (not supported by the prover).
+pub const MULTI_VALUE_DISABLED_VERSION: u16 = 3;
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -185,7 +193,7 @@ impl CompileConfig {
     fn engine_type(&self, target: Target, cranelift: bool) -> Engine {
         use wasmer::sys::EngineBuilder;
 
-        let mut wasmer_config: Box<dyn wasmer::CompilerConfig> = match cranelift {
+        let mut wasmer_config: Box<dyn wasmer::sys::CompilerConfig> = match cranelift {
             true => {
                 let mut wasmer_config = Cranelift::new();
                 wasmer_config.opt_level(CraneliftOptLevel::Speed);

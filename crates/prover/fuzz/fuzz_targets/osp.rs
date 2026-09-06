@@ -193,8 +193,6 @@ fn fuzz_impl(data: &[u8]) -> Result<()> {
         GlobalState::default(),
         Default::default(),
         prover::machine::get_empty_preimage_resolver(),
-        None,
-        0,
     )?;
     let mut last_hash = mach.hash();
     while mach.get_steps() <= MAX_STEPS {
