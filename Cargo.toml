@@ -28,7 +28,7 @@ homepage = "https://arbitrum.io"
 license = "BSL"
 publish = false
 repository = "https://github.com/OffchainLabs/nitro.git"
-rust-version = "1.88"
+rust-version = "1.93"
 
 [workspace.dependencies]
 alloy-rpc-types-engine = { version = "=1.6.3" }
